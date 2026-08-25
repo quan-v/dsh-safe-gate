@@ -24,11 +24,21 @@
 
 ## 安装
 
-一条命令，不碰 npm：
+不碰 npm、也不需要 PyPI 账号。三种方式任选：
 
 ```bash
-pip install dsh-guard       # 或：uvx dsh-guard
+# 方式一：从 GitHub 直接跑（推荐，无需安装任何账号）
+uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git"
+
+# 方式二：pip 从 GitHub 直接装
+pip install "git+https://github.com/quan-v/dsh-safe-gate.git"
+
+# 方式三：克隆下来直接跑（零依赖安装，最透明）
+git clone https://github.com/quan-v/dsh-safe-gate.git
+cd dsh-safe-gate && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
 ```
+
+> 说明：本项目未发布到 PyPI（作者无 PyPI 账号），所以不走 `pip install dsh-guard`。上面三个方式都能用，`uvx` 或 `pip install git+` 最省事，克隆最透明。核心逻辑零依赖（除可选的 tree-sitter），也能当单文件直接跑。
 
 ## 用法
 
