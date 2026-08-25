@@ -2,6 +2,8 @@
 
 **装前守门工具** —— 给 [DeepSeek Harness](https://github.com/deepseek-ai/dsh) 插件 / MCP 服务器在做安装、运行**之前**把一关。
 
+> **[English README](./README.en.md)**
+
 它不替你做决定，但在你（或你的 agent）装东西**之前**，用两套检查提前拦雷：**供应链**（这个包是不是已知投毒/坏版本）和**契约**（这个插件代码会不会让 dsh 加载就崩）。
 
 ## 它能干什么
