@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsh-guard"
+version = "0.1.0"
+description = "Pre-flight safety gate for dsh plugins / MCP servers: OSV supply-chain scan + agent-written plugin contract checks."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "tree-sitter>=0.25",
+    "tree-sitter-javascript>=0.23",
+]
+
+[project.scripts]
+dsh-guard = "dsh_guard:main"
+
+[tool.setuptools]
+py-modules = ["dsh_guard"]

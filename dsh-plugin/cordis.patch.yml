@@ -1,0 +1,7 @@
+# dsh-guard-panel bundle layer: applied automatically when the package is installed.
+# Inserts the dsh-guard-panel plugin row into the web profile's plugin list.
+# The safety-gate logic itself lives in the standalone Python tool (dsh_guard.py);
+# this plugin is only its configuration/history panel.
+- insert:
+    - id: dsh-guard-panel
+      name: dsh-guard-panel
