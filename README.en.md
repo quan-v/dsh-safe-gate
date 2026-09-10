@@ -31,16 +31,18 @@ No npm, no PyPI account needed. Three ways:
 
 ```bash
 # 1. Run straight from GitHub (recommended)
-uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git"
+uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.0"
 
 # 2. pip from GitHub
-pip install "git+https://github.com/quan-v/dsh-safe-gate.git"
+pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.0"
 
 # 3. Clone and run (zero install, most transparent)
 git clone https://github.com/quan-v/dsh-safe-gate.git
-cd dsh-safe-gate && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
+cd dsh-safe-gate && git checkout v0.1.0 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
 ```
 
+> **Naming:** the repo is dsh-safe-gate, the tool/command is dsh-guard — same project. Install URLs use the repo name, the CLI is dsh-guard.
+>
 > Not published to PyPI (the author has no PyPI account), so `pip install dsh-guard` from the index won't work. All three methods above do. The core is dependency-free (optional tree-sitter apart), and can even be run as a single file.
 
 ## Usage
@@ -79,7 +81,7 @@ Append `--json` to any command for machine-readable output.
 ## As an MCP tool (into dsh)
 
 ```bash
-dsh mcp add dsh-guard -- uvx dsh-guard --mcp
+dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.0" --mcp
 ```
 
 Then dsh's agent can call the `dsh_guard_check` tool — ask it before installing any plugin/MCP server.
