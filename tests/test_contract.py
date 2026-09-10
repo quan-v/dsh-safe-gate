@@ -1,3 +1,4 @@
+import pytest
 import os
 import dsh_guard
 
@@ -33,9 +34,13 @@ def test_good_adapter_clean():
     assert errors(fx("good_adapter.js")) == []
 
 # ── 真实 dsh 插件回归护栏 ──
-REAL = r"%USERPROFILE%\.dsh\profiles\web\node_modules"
+REAL = os.path.expanduser("~/.dsh/profiles/web/node_modules")
+_REAL_ROUTER = os.path.join(REAL, "dsh-vision-router", "index.js")
+_REAL_MCUI = os.path.join(REAL, "dsh-mcp-ui", "lib", "client.js")
+@pytest.mark.skipif(not os.path.exists(_REAL_ROUTER), reason="作者本机 dsh 环境,不存在则跳过")
 def test_vision_router_no_error():
     assert errors(os.path.join(REAL, "dsh-vision-router", "index.js")) == []
 
+@pytest.mark.skipif(not os.path.exists(_REAL_MCUI), reason="作者本机 dsh 环境,不存在则跳过")
 def test_mcp_ui_client_no_error():
     assert errors(os.path.join(REAL, "dsh-mcp-ui", "lib", "client.js"), client=True) == []

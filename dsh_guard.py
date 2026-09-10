@@ -21,6 +21,7 @@ SERVER_INJECT = {"tools", "settings", "llm"}
 CLIENT_INJECT = {"settingsScope", "slots", "locale", "agent", "storage",
                  "connection", "conversation", "modelSelection", "ui"}
 OSV_URL = "https://api.osv.dev/v1/query"
+__version__ = "0.1.1"
 
 # ─────────────────────────── 包名解析 ───────────────────────────
 def parse_pkg(s):
@@ -177,13 +178,16 @@ def _node():
     n = shutil.which("node")
     if n:
         return n
-    for cand in (r"%LOCALAPPDATA%/hermes/node/node.exe", "node.exe"):
+    for cand in (os.path.expanduser("~/AppData/Local/hermes/node/node.exe"), "node.exe"):
         if cand and os.path.exists(cand):
             return cand
     return "node"
 
 def _node_check(path):
-    r = _sp.run([_node(), "--check", path], capture_output=True, text=True)
+    try:
+        r = _sp.run([_node(), "--check", path], capture_output=True, text=True)
+    except (FileNotFoundError, OSError):
+        return None  # node 可选:缺失时跳过权威语法检查(tree-sitter 仍覆盖 await 检查)
     if r.returncode != 0:
         err = (r.stderr or r.stdout).strip().splitlines()
         return f"node --check 失败:{err[-1][:130] if err else '语法错误'}"
@@ -305,7 +309,7 @@ def serve_mcp():
         if method == "initialize":
             resp = {"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}}, "serverInfo": {"name": "dsh-guard", "version": "0.1.0"}}}
+                "capabilities": {"tools": {}}, "serverInfo": {"name": "dsh-guard", "version": __version__}}}
         elif method == "notifications/initialized" or msg.get("method", "").startswith("notifications"):
             resp = None
         elif method == "tools/list":
@@ -328,8 +332,8 @@ def serve_mcp():
             sys.stdout.flush()
 
 # ─────────────────────────── 守门后放行(G4 safe-add)───────────────────────────
-def _safe_add(pkg, path, client, delegate):
-    import shlex, subprocess
+def _safe_add(pkg, path, client, delegate, yes=False):
+    import subprocess
     name, ver = parse_pkg(pkg)
     v, d = check_supply(name, ver)
     print(f"[{v.upper()}] 供应链: {d}")
@@ -341,13 +345,29 @@ def _safe_add(pkg, path, client, delegate):
     has_error = v == "block" or any(l == "error" for l, _ in findings)
     if has_error:
         print("REFUSED → 未通过检查,不执行安装。")
+        audit({"cmd": "safe-add", "target": pkg, "path": path, "verdict": "block", "detail": d})
         return 1
+    has_warn = v == "warn" or any(l == "warn" for l, _ in findings)
+    if has_warn and delegate and not yes:
+        import sys as _sys
+        if not _sys.stdin.isatty():
+            print("REFUSED → 有 warn 级发现,非交互环境需 --yes 显式放行。")
+            audit({"cmd": "safe-add", "target": pkg, "path": path, "verdict": "warn-refused", "detail": d})
+            return 1
+        ans = input("有 warn 级发现,仍要执行? [y/N] ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("REFUSED → 用户未确认。")
+            audit({"cmd": "safe-add", "target": pkg, "path": path, "verdict": "warn-refused", "detail": d})
+            return 1
     print("SAFE → 检查通过。")
     if delegate:
         print(f"执行: {delegate}")
         import sys as _sys
         _sys.stdout.flush()
-        return subprocess.run(shlex.split(delegate)).returncode
+        rc = subprocess.run(delegate, shell=True).returncode
+        audit({"cmd": "safe-add", "target": pkg, "path": path, "verdict": "executed", "delegate_rc": rc})
+        return rc
+    audit({"cmd": "safe-add", "target": pkg, "path": path, "verdict": v, "detail": d})
     return 0
 
 # ─────────────────────────── 自更新治理(G7 update-guard)───────────────────────────
@@ -363,7 +383,7 @@ def _snapshot():
     core = "?"
     for cand in (
         os.path.expanduser("~/.dsh/profiles/web/node_modules/@deepseek-ai/dsh/package.json"),
-        "%LOCALAPPDATA%/hermes/node/node_modules/@deepseek-ai/dsh/package.json",
+        os.path.expanduser("~/AppData/Local/hermes/node/node_modules/@deepseek-ai/dsh/package.json"),
     ):
         try:
             core = json.load(open(cand, encoding="utf-8")).get("version", "?")
@@ -387,7 +407,7 @@ def _major_jump(b, a):
     return ma > mb
 
 def update_guard(cmd):
-    import shlex, subprocess
+    import subprocess
     before = _snapshot()
     print(f"更新前: dsh 核心 {before['dsh_core']}, {len(before['plugins'])} 个插件")
     audit({"cmd": "update-guard", "stage": "before", "verdict": "ok",
@@ -395,7 +415,7 @@ def update_guard(cmd):
     if cmd:
         print(f"执行: {cmd}")
         import sys as _sys; _sys.stdout.flush()
-        r = subprocess.run(shlex.split(cmd))
+        r = subprocess.run(cmd, shell=True)
         if r.returncode != 0:
             print(f"⚠️ 更新命令退出码 {r.returncode}")
             audit({"cmd": "update-guard", "stage": "exec", "verdict": "error", "exit": r.returncode})
@@ -511,7 +531,12 @@ def serve_ui(port=8170):
     class H(http.server.BaseHTTPRequestHandler):
         def _send(self, body, ct="application/json"):
             self.send_response(200); self.send_header("Content-Type", ct); self.end_headers(); self.wfile.write(body)
+        def _host_ok(self):
+            h = self.headers.get("Host", "")
+            return h in ("127.0.0.1:%s" % port, "localhost:%s" % port)
         def do_GET(self):
+            if not self._host_ok():
+                self.send_response(403); self.end_headers(); return
             u = urllib.parse.urlparse(self.path)
             if u.path == "/":
                 self._send(UI_HTML.encode("utf-8"), "text/html;charset=utf-8"); return
@@ -524,6 +549,8 @@ def serve_ui(port=8170):
                 self._send(json.dumps(_read_audit(flt), ensure_ascii=False).encode("utf-8")); return
             self.send_response(404); self.end_headers()
         def do_POST(self):
+            if not self._host_ok():
+                self.send_response(403); self.end_headers(); return
             if self.path == "/api/consent":
                 ln = int(self.headers.get("Content-Length", 0))
                 data = json.loads(self.rfile.read(ln) or b"{}")
@@ -549,7 +576,7 @@ def main():
     p1 = sub.add_parser("check", help="供应链检查 pkg[@version]"); p1.add_argument("pkg"); p1.add_argument("--json", action="store_true")
     p2 = sub.add_parser("check-file", help="本地插件契约检查"); p2.add_argument("path"); p2.add_argument("--client", action="store_true"); p2.add_argument("--json", action="store_true")
     p3 = sub.add_parser("all", help="两者都查"); p3.add_argument("pkg"); p3.add_argument("path"); p3.add_argument("--client", action="store_true")
-    p4 = sub.add_parser("safe-add", help="守门后放行:检查通过才执行(delegate)"); p4.add_argument("pkg"); p4.add_argument("--path"); p4.add_argument("--client", action="store_true"); p4.add_argument("--delegate")
+    p4 = sub.add_parser("safe-add", help="守门后放行:检查通过才执行(delegate)"); p4.add_argument("pkg"); p4.add_argument("--path"); p4.add_argument("--client", action="store_true"); p4.add_argument("--delegate"); p4.add_argument("--yes", action="store_true", help="warn 级发现仍放行(非交互环境必填)")
     p5 = sub.add_parser("scan", help="源码级敌意模式扫描(外传/窃密/后门/混淆)"); p5.add_argument("path"); p5.add_argument("--json", action="store_true")
     p6 = sub.add_parser("log", help="查看审计日志"); p6.add_argument("-n", type=int, default=10); p6.add_argument("--grep", default=None)
     p7 = sub.add_parser("update-guard", help="自更新治理:快照→执行→diff→审计"); p7.add_argument("--exec", default=None)
@@ -588,7 +615,7 @@ def main():
         audit({"cmd": "all", "target": args.pkg, "path": args.path, "verdict": v, "findings": len(fnd)})
         sys.exit(0 if v != "block" and not any(l == "error" for l, _ in fnd) else 1)
     elif args.cmd == "safe-add":
-        sys.exit(_safe_add(args.pkg, args.path, args.client, args.delegate))
+        sys.exit(_safe_add(args.pkg, args.path, args.client, args.delegate, getattr(args, "yes", False)))
     elif args.cmd == "scan":
         hits = _hostile_scan(args.path)
         ver = "error" if any(l == "error" for l, _, _ in hits) else ("warn" if hits else "allow")

@@ -33,3 +33,14 @@ def test_safe_add_contract_error_refuses():
 def test_safe_add_no_delegate_exit_zero():
     r = cli("safe-add", "@antv/mcp-server-chart@0.9.10")
     assert r.returncode == 0
+
+def test_safe_add_warn_noninteractive_refuses():
+    # warn(未 pinning,离线早退) + 非交互 + 无 --yes → 拒绝执行
+    r = cli("safe-add", "@antv/mcp-server-chart", "--delegate", "echo SHOULD_NOT_RUN")
+    assert r.returncode != 0
+    assert "SHOULD_NOT_RUN" not in r.stdout
+
+def test_safe_add_warn_yes_delegates():
+    r = cli("safe-add", "@antv/mcp-server-chart", "--yes", "--delegate", "echo WARN_RUN")
+    assert r.returncode == 0
+    assert "WARN_RUN" in r.stdout

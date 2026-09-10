@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dsh-guard"
-version = "0.1.0"
+version = "0.1.1"
 description = "Pre-flight safety gate for dsh plugins / MCP servers: OSV supply-chain scan + agent-written plugin contract checks."
 readme = "README.md"
 requires-python = ">=3.9"

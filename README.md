@@ -31,11 +31,11 @@
 不碰 npm、也不需要 PyPI 账号。三种方式任选：
 
 ```bash
-# 方式一：从 GitHub 直接跑（推荐，无需安装任何账号；@v0.1.0 锁定版本 —— 守门工具自己也不许 main 漂移）
-uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.0"
+# 方式一：从 GitHub 直接跑（推荐，无需安装任何账号；@v0.1.1 锁定版本 —— 守门工具自己也不许 main 漂移）
+uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.1"
 
 # 方式二：pip 从 GitHub 直接装
-pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.0"
+pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.1"
 
 # 方式三：克隆下来直接跑（零依赖安装，最透明）
 git clone https://github.com/quan-v/dsh-safe-gate.git
@@ -64,6 +64,7 @@ dsh-guard all "@antv/mcp-server-chart@0.11.10" ./my-plugin/index.js
 
 # 守门后放行（检查通过才执行 delegate）
 dsh-guard safe-add "@antv/mcp-server-chart@0.9.10" --path ./my-plugin/index.js --delegate "dsh plugin add ..."
+# warn 级发现时:safe-add 会交互确认;非交互环境(agent)需加 --yes 才放行
 
 # 审计日志（每次检查留证据链 → ~/.dsh-guard/audit.jsonl）
 dsh-guard log [-n 10] [--grep 关键词]
@@ -80,7 +81,7 @@ dsh-guard ui [--port 8170]
 ## 作为 MCP 工具接入 dsh
 
 ```bash
-dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.0" --mcp
+dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.1" --mcp
 ```
 dsh 的 agent 就能调用 `dsh_guard_check` 工具 —— 装任何插件/MCP 服务器前先问它。
 
