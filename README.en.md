@@ -38,7 +38,7 @@ pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.1"
 
 # 3. Clone and run (zero install, most transparent)
 git clone https://github.com/quan-v/dsh-safe-gate.git
-cd dsh-safe-gate && git checkout v0.1.0 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
+cd dsh-safe-gate && git checkout v0.1.1 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
 ```
 
 > **Naming:** the repo is dsh-safe-gate, the tool/command is dsh-guard — same project. Install URLs use the repo name, the CLI is dsh-guard.
