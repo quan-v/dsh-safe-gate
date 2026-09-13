@@ -26,20 +26,38 @@ It doesn't decide for you — it gives you three checks up front:
 - 🟡 `warn` (combo): secret+network / shell+network (medium; benign standalone use is not flagged)
 - ✅ ignored: genuinely benign (`setInterval`, bare `fetch`, generic `process.env`)
 
+## Known limits (stated plainly)
+
+Static scanning looks at how code *looks*, so these will slip past. Listed so you don't
+mistake it for more than it is:
+
+- **Indirection**: `const B = "bash"; spawn(B, ["-c", "curl …"])` — a non-literal program name isn't recognized.
+- **Interpreter wrapping**: `spawn("env", ["bash", "-c", …])` or `spawn("python", ["-c", …])` — one layer around it and the check is gone.
+- **Destructive-but-offline commands**: `spawn("bash", ["-c", "rm -rf /"])` is not reported. The tool targets
+  **exfiltration / credential theft / supply-chain poisoning**; destructive commands are outside its promise.
+- **Anything assembled at runtime**: a command fetched from a server and executed, or built by string
+  concatenation, is invisible to static analysis.
+- **False positives still happen.** It matches patterns, not intent. When it fires, the right reading is
+  "worth a look", not "this plugin is bad".
+
+That is also why it should be used as **a check that makes you pause for a second — not a security guarantee.**
+**Plugins from the marketplace go through an approval process, and that is your primary defence. This tool
+is for what you install from outside it.**
+
 ## Install
 
 No npm, no PyPI account needed. Three ways:
 
 ```bash
 # 1. Run straight from GitHub (recommended)
-uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.4"
+uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.5"
 
 # 2. pip from GitHub
-pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.4"
+pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.5"
 
 # 3. Clone and run (zero install, most transparent)
 git clone https://github.com/quan-v/dsh-safe-gate.git
-cd dsh-safe-gate && git checkout v0.1.4 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
+cd dsh-safe-gate && git checkout v0.1.5 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
 ```
 
 > **Naming:** the repo is dsh-safe-gate, the tool/command is dsh-guard — same project. Install URLs use the repo name, the CLI is dsh-guard.
@@ -82,7 +100,7 @@ Append `--json` to any command for machine-readable output.
 ## As an MCP tool (into dsh)
 
 ```bash
-dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.4" --mcp
+dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.5" --mcp
 ```
 
 Then dsh's agent can call the `dsh_guard_check` tool — ask it before installing any plugin/MCP server.
