@@ -26,7 +26,7 @@ It doesn't decide for you — it gives you three checks up front:
 - 🟡 `warn` (combo): secret+network / shell+network (medium; benign standalone use is not flagged)
 - ✅ ignored: genuinely benign (`setInterval`, bare `fetch`, generic `process.env`)
 
-## Known limits (stated plainly)
+## Known limits
 
 Static scanning looks at how code *looks*, so these will slip past. Listed so you don't
 mistake it for more than it is:
