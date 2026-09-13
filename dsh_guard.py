@@ -21,7 +21,7 @@ SERVER_INJECT = {"tools", "settings", "llm"}
 CLIENT_INJECT = {"settingsScope", "slots", "locale", "agent", "storage",
                  "connection", "conversation", "modelSelection", "ui"}
 OSV_URL = "https://api.osv.dev/v1/query"
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # ─────────────────────────── 包名解析 ───────────────────────────
 def parse_pkg(s):
@@ -401,7 +401,10 @@ HOSTILE_MARKER = [r"kitty-monitor", r"harkonnen", r"melange", r"/bin/sh\s+-c", r
 HOSTILE_HIGH = {
     # exec/execSync 与 execFile 风险不同(execFile 不走 shell、参数以数组传递)→ 加负向前瞻,
     # 否则 "child_process.execFile" 会被 "exec" 前缀吃掉,真实插件实测误报。
-    "shell_exec":    [r"child_process\.(?:exec|execSync|spawn|spawnSync)(?![\w$])"],
+    # 只有 exec/execSync 会走 shell(命令字符串拼接 → 注入面),单信号即报。
+    # spawn/spawnSync/execFile 参数以数组传递、不经 shell,是插件起子进程的常态
+    # (实测把 spawn 当单信号会让真实插件刷出 101 条告警 → 误报灾难,见 REPORT5 的教训)。
+    "shell_exec":    [r"child_process\.(?:exec|execSync)(?![\w$])"],
     "arbitrary_eval":[r"\beval\s*\(|\bnew\s+Function\s*\(|\bFunction\s*\("],
     # 只认"名字本身就是密钥"的变量:裸厂商前缀会把 DEEPSEEK_BASE_URL(地址)也算进来。
     # 泛 process.env 一律不报(README 已把"泛 process.env"列为良性)。
@@ -476,25 +479,37 @@ def _strip_noise(src, keep_strings=False):
     return "".join(out)
 
 
-def _cp_exec_import_line(src):
-    """引入 child_process 且引入的是**走 shell** 的变体(exec/execSync)时的行号,否则 None。
+def _cp_import_line(src, names):
+    """引入 child_process 且引出的名字落在 names 里时的行号,否则 None。
 
-    为什么不能"见到 require('child_process') 就报":execFile/spawn 不走 shell、参数以数组传递,
-    风险与 exec 不同 —— 真人插件里 execFile 很常见,一律报就是误报(REPORT5 的 m3)。
-    覆盖两种真实写法:
-      解构:const {exec, spawn} = require('child_process')    → 看解构名里有没有 exec/execSync
-      别名:const cp = require('child_process'); cp.exec(…)    → 看别名变量有没有被 .exec( 调用
-    注意 JS 里 RegExp.prototype.exec 极其常见,所以只在"确认与 child_process 别名绑定"后才报,
-    绝不裸报 \bexec\(。
+    模块名住在字符串里,而 _strip_noise 会抹掉字符串 —— 所以这一组在"只抹注释、保留字符串"
+    的 code_s 上跑(注释里的示例代码依然不会误报)。
+    覆盖四种真实写法(REPORT6 的 s1/s2/s4/t4/s7 正是前几种的漏网之鱼):
+      ① 解构     const { exec } = require('child_process') / import { execSync } from 'node:child_process'
+      ② 别名     const cp = require('child_process'); cp.exec(…)
+      ③ 命名空间 import * as cp from 'node:child_process'; cp.exec(…)
+      ④ 内联     require('child_process').exec(…)
+    never 裸报 \bexec\(:JS 里 RegExp.prototype.exec 到处都是,只有确认与 child_process 绑定才报。
     """
     NL = chr(10)
-    for m in _re.finditer(r"\{([^}]*)\}\s*=\s*require\s*\(\s*['\"](?:node:)?child_process['\"]", src):
-        if _re.search(r"\b(?:exec|execSync)\b", m.group(1)):
-            return src.count(NL, 0, m.start()) + 1
-    for m in _re.finditer(r"\b([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['\"](?:node:)?child_process['\"]", src):
-        var = m.group(1)
-        if _re.search(r"\b" + _re.escape(var) + r"\s*\.\s*(?:exec|execSync)(?![\w$])", src):
-            return src.count(NL, 0, m.start()) + 1
+    SPEC = r"\s*['\"](?:node:)?child_process['\"]"
+    ALT = r"(?:" + "|".join(names) + r")(?![\w$])"
+
+    def line_of(m):
+        return src.count(NL, 0, m.start()) + 1
+
+    # ① 解构 / 命名导入:看引出来的名字
+    for m in _re.finditer(r"(?:\{([^}]*)\}\s*=\s*require\s*\(|import\s*\{([^}]*)\}\s*from)" + SPEC, src):
+        if _re.search(r"\b" + ALT, (m.group(1) or m.group(2) or "")):
+            return line_of(m)
+    # ② 别名 / 命名空间导入:看那个变量有没有被 .<name>( 调用
+    for m in _re.finditer(r"(?:\b([A-Za-z_$][\w$]*)\s*=\s*require\s*\(|import\s+(?:\*\s*as\s+)?([A-Za-z_$][\w$]*)\s+from)" + SPEC, src):
+        var = m.group(1) or m.group(2)
+        if _re.search(r"\b" + _re.escape(var) + r"\s*\.\s*" + ALT, src):
+            return line_of(m)
+    # ③ 内联:require('child_process').<name>(…)
+    for m in _re.finditer(r"require\s*\(\s*['\"](?:node:)?child_process['\"]\s*\)\s*\.\s*" + ALT, src):
+        return line_of(m)
     return None
 
 
@@ -572,7 +587,7 @@ def _hostile_scan(path):
         if ln:
             hits.append(("error", f"投毒/外传标记(第 {ln} 行)", f))
         # shell_exec:调用式(child_process.exec…)或引入式(require('child_process'))任一命中
-        ln_shell = _hit_line(code, HOSTILE_HIGH["shell_exec"]) or _cp_exec_import_line(code_s)
+        ln_shell = _hit_line(code, HOSTILE_HIGH["shell_exec"]) or _cp_import_line(code_s, ("exec", "execSync"))
         ln_eval = _hit_line(code, HOSTILE_HIGH["arbitrary_eval"])
         ln_secret = _hit_line(code, HOSTILE_HIGH["secret_read"])
         if ln_shell:
@@ -585,6 +600,9 @@ def _hostile_scan(path):
         # 组合信号:两个信号现在都来自真实代码,注释凑不出"疑似窃密"
         if has_net and ln_secret:
             hits.append(("warn", f"读密钥+网络(疑似窃密;密钥在第 {ln_secret} 行)", f))
+        # shell 侧只用走 shell 的 exec/execSync:spawn/execFile 参数以数组传递、不经 shell,
+        # 而"起子进程 + 联网"在真实插件里是常态(实测纳入后仅 11 个插件就刷出 46 条) ——
+        # 宁可少查一类低风险行为,也不让门被噪音淹掉(REPORT5 的核心教训)。
         if has_net and ln_shell:
             hits.append(("warn", f"shell+网络(疑似外传;shell 在第 {ln_shell} 行)", f))
         ln = _hit_line(code, HOSTILE_PERSIST)

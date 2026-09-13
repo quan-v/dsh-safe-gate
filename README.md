@@ -31,15 +31,15 @@
 不碰 npm、也不需要 PyPI 账号。三种方式任选：
 
 ```bash
-# 方式一：从 GitHub 直接跑（推荐，无需安装任何账号；@v0.1.2 锁定版本 —— 守门工具自己也不许 main 漂移）
-uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.2"
+# 方式一：从 GitHub 直接跑（推荐，无需安装任何账号；@v0.1.3 锁定版本 —— 守门工具自己也不许 main 漂移）
+uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.3"
 
 # 方式二：pip 从 GitHub 直接装
-pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.2"
+pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.3"
 
 # 方式三：克隆下来直接跑（零依赖安装，最透明）
 git clone https://github.com/quan-v/dsh-safe-gate.git
-cd dsh-safe-gate && git checkout v0.1.2 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
+cd dsh-safe-gate && git checkout v0.1.3 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
 ```
 
 > 说明：本项目未发布到 PyPI（作者无 PyPI 账号），所以不走 `pip install dsh-guard`。上面三个方式都能用，`uvx` 或 `pip install git+` 最省事，克隆最透明。核心逻辑零依赖（除可选的 tree-sitter），也能当单文件直接跑。
@@ -81,7 +81,7 @@ dsh-guard ui [--port 8170]
 ## 作为 MCP 工具接入 dsh
 
 ```bash
-dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.2" --mcp
+dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.3" --mcp
 ```
 dsh 的 agent 就能调用 `dsh_guard_check` 工具 —— 装任何插件/MCP 服务器前先问它。
 
