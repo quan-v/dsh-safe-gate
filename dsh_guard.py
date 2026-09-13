@@ -21,7 +21,7 @@ SERVER_INJECT = {"tools", "settings", "llm"}
 CLIENT_INJECT = {"settingsScope", "slots", "locale", "agent", "storage",
                  "connection", "conversation", "modelSelection", "ui"}
 OSV_URL = "https://api.osv.dev/v1/query"
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 # ─────────────────────────── 包名解析 ───────────────────────────
 def parse_pkg(s):
@@ -410,6 +410,12 @@ HOSTILE_HIGH = {
     # 泛 process.env 一律不报(README 已把"泛 process.env"列为良性)。
     "secret_read":   [r"process\.env\.[A-Za-z0-9_]*?(?:API_?KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|ACCESS_KEY)[A-Za-z0-9_]*|toJSON\(secrets\)|credentials\.ya?ml|auth\.json"],
 }
+# spawn/execFile 绝大多数形态不报(数组传参、起子进程是插件常态),但下面两种语义无歧义:
+#   ① shell 宿主 —— spawn('bash', ['-c', …]) :数组传递**不等于**不经 shell
+#   ② 外传工具 —— spawn('curl', ['-d', secret, url]) :不经 shell **不等于**不危险
+# 这两组是 REPORT7 用探针实测出的漏洞(v1/v2/v3 此前全部漏报),又不会把误报率推回去。
+HOSTILE_SPAWN_HOST = [r"\b(?:spawn|spawnSync|execFile)\s*\(\s*['\"](?:[^'\"]*[\\/])?(?:sh|bash|zsh|cmd(?:\.exe)?|powershell|pwsh)['\"]"]
+HOSTILE_SPAWN_EXFIL = [r"\b(?:spawn|spawnSync|execFile)\s*\(\s*['\"](?:[^'\"]*[\\/])?(?:curl|wget|ncat|nc)['\"]"]
 HOSTILE_NET = [r"require\(['\"](?:http|https|net|dgram|tls)['\"]\)|/dev/tcp/|\bcurl\s+|\bfetch\(|WebClient|DownloadString"]
 HOSTILE_PERSIST = [r"cron\.schedule|\bRun Copilot\b|schtasks|/etc/cron|Registry\\\\.*Run"]
 
@@ -605,6 +611,13 @@ def _hostile_scan(path):
         # 宁可少查一类低风险行为,也不让门被噪音淹掉(REPORT5 的核心教训)。
         if has_net and ln_shell:
             hits.append(("warn", f"shell+网络(疑似外传;shell 在第 {ln_shell} 行)", f))
+        # spawn 的两种无歧义形态(shell 宿主 / 调外传工具)——字符串里,所以在 code_s 上判
+        ln_host = _hit_line(code_s, HOSTILE_SPAWN_HOST)
+        if ln_host:
+            hits.append(("warn", f"高危单信号:shell 执行(spawn 调 shell 本体;第 {ln_host} 行)", f))
+        ln_exfil = _hit_line(code_s, HOSTILE_SPAWN_EXFIL)
+        if ln_exfil:
+            hits.append(("warn", f"高危单信号:外传工具(spawn 调 curl/wget 等;第 {ln_exfil} 行)", f))
         ln = _hit_line(code, HOSTILE_PERSIST)
         if ln:
             hits.append(("warn", f"持久化/后门迹象(第 {ln} 行)", f))

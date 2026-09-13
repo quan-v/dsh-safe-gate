@@ -14,7 +14,7 @@ It doesn't decide for you — it gives you three checks up front:
 |---|---|---|
 | **Supply chain** | Known-malicious/vulnerable npm packages (OSV/MAL-*); unpinned versions | `block` / `warn` / `allow` |
 | **Contract** | Patterns that make dsh fail at load: `await` in a non-async function, an `inject` service outside the whitelist, a keyed slot missing `key`, an adapter missing `prepareCall` | error / warn |
-| **Source hostility** | Dangerous behavior in plugin source: malware markers, `child_process`/`eval`/secret reads, exfil/credential combinat ions, persistence backdoors | block / warn |
+| **Source hostility** | Dangerous behavior in plugin source: malware markers, `eval` / secret reads, exfil and credential combos, persistence backdoors, plus the `child_process` forms that **actually go through a shell** (`exec`/`execSync`; `spawn` is reported only when it launches a shell itself (`bash -c`) or an exfil tool (`curl`/`wget`) — plain `spawn`/`execFile` is normal plugin behavior and stays quiet) | block / warn |
 | **Version jump** | Large version jumps on self-update (`0.x`-aware), warn before a breaking update. **Runs only in `update-guard`, not in the pre-install gate.** | warn |
 
 ### Verdict logic (tiered severity)
@@ -32,14 +32,14 @@ No npm, no PyPI account needed. Three ways:
 
 ```bash
 # 1. Run straight from GitHub (recommended)
-uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.3"
+uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.4"
 
 # 2. pip from GitHub
-pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.3"
+pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.4"
 
 # 3. Clone and run (zero install, most transparent)
 git clone https://github.com/quan-v/dsh-safe-gate.git
-cd dsh-safe-gate && git checkout v0.1.3 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
+cd dsh-safe-gate && git checkout v0.1.4 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
 ```
 
 > **Naming:** the repo is dsh-safe-gate, the tool/command is dsh-guard — same project. Install URLs use the repo name, the CLI is dsh-guard.
@@ -82,7 +82,7 @@ Append `--json` to any command for machine-readable output.
 ## As an MCP tool (into dsh)
 
 ```bash
-dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.3" --mcp
+dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.4" --mcp
 ```
 
 Then dsh's agent can call the `dsh_guard_check` tool — ask it before installing any plugin/MCP server.
