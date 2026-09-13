@@ -126,7 +126,7 @@ dsh-guard is a **decision-point gate**, not a resident anti-malware scanner:
 - **Does not do**: filesystem real-time watching, on-access hooks, background resident daemons, full-disk / whole node_modules rescans.
 - Trade-off: on-demand = cheap but **not automatic** (an agent must call it) — an intentional choice.
 
-## Known limitations (honest)
+## Known limitations
 
 - **Knows only "known" advisories**: OSV covers published advisories; cold/new/not-yet-indexed malicious packages go undetected.
 - **Not a behavior sandbox**: it isn't an isolator — if a package does something bad at runtime, it can't stop that (dsh's execution-layer sandbox does).
