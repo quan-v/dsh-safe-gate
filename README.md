@@ -6,7 +6,7 @@
 >
 > 命名说明：仓库名是 dsh-safe-gate，工具/命令名是 dsh-guard —— 同一个项目。git+ 安装 URL 用仓库名，命令行用 dsh-guard。
 
-它不替你做决定，但在你（或你的 agent）装东西**之前**，用两套检查提前拦雷：**供应链**（这个包是不是已知投毒/坏版本）和**契约**（这个插件代码会不会让 dsh 加载就崩）。
+它不替你做决定，但在你（或你的 agent）装东西**之前**，用三套检查提前拦雷：**供应链**（这个包是不是已知投毒/坏版本）、**契约**（这个插件代码会不会让 dsh 加载就崩）和**源码敌意**（这段代码会不会在你机器上干危险的事——读密钥、shell 与联网串起来、留持久化后门）。
 
 ## 它能干什么
 
@@ -15,7 +15,7 @@
 | **供应链** | 查 [OSV.dev](https://osv.dev)（免费，含 `MAL-*` 恶意软件命名空间）确认 npm 包是否已知恶意/脆弱；版本未 pinning 也提示 | `block` / `warn` / `allow` |
 | **契约** | 静态检查会让 dsh 加载失败的模式：非 async 函数里的 `await`、`inject` 服务不在白名单、keyed slot 缺 `key`、adapter 缺 `prepareCall` | error / warn |
 | **源码敌意** | 扫插件源码里的危险行为：投毒标记、`child_process`/`eval`/读密钥、外传/窃密组合、持久化后门 | block / warn |
-| **版本跳变** | 自更新时检测大版本跳变（`0.x` 感知），提前预警破坏性更新 | warn |
+| **版本跳变** | 自更新时检测大版本跳变（`0.x` 感知），提前预警破坏性更新。**只在 `update-guard` 里跑，不在装前守门流程内** | warn |
 
 ### 守门判定逻辑（分档严重度）
 
@@ -31,15 +31,15 @@
 不碰 npm、也不需要 PyPI 账号。三种方式任选：
 
 ```bash
-# 方式一：从 GitHub 直接跑（推荐，无需安装任何账号；@v0.1.1 锁定版本 —— 守门工具自己也不许 main 漂移）
-uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.1"
+# 方式一：从 GitHub 直接跑（推荐，无需安装任何账号；@v0.1.2 锁定版本 —— 守门工具自己也不许 main 漂移）
+uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.2"
 
 # 方式二：pip 从 GitHub 直接装
-pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.1"
+pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.2"
 
 # 方式三：克隆下来直接跑（零依赖安装，最透明）
 git clone https://github.com/quan-v/dsh-safe-gate.git
-cd dsh-safe-gate && git checkout v0.1.1 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
+cd dsh-safe-gate && git checkout v0.1.2 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
 ```
 
 > 说明：本项目未发布到 PyPI（作者无 PyPI 账号），所以不走 `pip install dsh-guard`。上面三个方式都能用，`uvx` 或 `pip install git+` 最省事，克隆最透明。核心逻辑零依赖（除可选的 tree-sitter），也能当单文件直接跑。
@@ -81,7 +81,7 @@ dsh-guard ui [--port 8170]
 ## 作为 MCP 工具接入 dsh
 
 ```bash
-dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.1" --mcp
+dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.2" --mcp
 ```
 dsh 的 agent 就能调用 `dsh_guard_check` 工具 —— 装任何插件/MCP 服务器前先问它。
 

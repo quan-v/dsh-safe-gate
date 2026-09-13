@@ -21,7 +21,7 @@ SERVER_INJECT = {"tools", "settings", "llm"}
 CLIENT_INJECT = {"settingsScope", "slots", "locale", "agent", "storage",
                  "connection", "conversation", "modelSelection", "ui"}
 OSV_URL = "https://api.osv.dev/v1/query"
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # ─────────────────────────── 包名解析 ───────────────────────────
 def parse_pkg(s):
@@ -37,11 +37,27 @@ def parse_pkg(s):
 # ─────────────────────────── OSV / 供应链 ───────────────────────────
 # ─────────────────────────── 审计日志(G6)───────────────────────────
 def audit(entry):
-    import os, json, datetime
+    """追加一条审计记录。
+
+    结果优先:日志写不进去也不能影响命令本身的输出 —— 依次尝试候选路径,
+    全部失败只告警(stderr),绝不抛异常(沙箱/只读环境里命令仍要正常给出结果)。
+    """
+    global _LOG_PATH
+    import os, json, datetime, sys
     e = dict(entry); e.setdefault("ts", datetime.datetime.now().isoformat(timespec="seconds"))
-    d = os.path.dirname(_log_file()); os.makedirs(d, exist_ok=True)
-    with open(_log_file(), "a", encoding="utf-8") as f:
-        f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    line = json.dumps(e, ensure_ascii=False) + "\n"
+    for p in ([_LOG_PATH] if _LOG_PATH else _log_candidates()):
+        try:
+            d = os.path.dirname(p)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line)
+            _LOG_PATH = p
+            return
+        except Exception:
+            continue
+    print("[dsh-guard] 警告:审计日志写入失败(已跳过,不影响检查结果)", file=sys.stderr)
 
 def show_log(n=10, grep=None):
     import os, json
@@ -57,9 +73,37 @@ def show_log(n=10, grep=None):
         try: print(json.dumps(json.loads(line), ensure_ascii=False))
         except Exception: print(line)
 
+_LOG_PATH = None  # 实际写入成功的日志路径(首次成功后缓存,避免每次都试探)
+
+def _log_candidates():
+    """审计日志候选路径:环境变量指定 > 家目录 > 当前工作区 > 临时目录。
+
+    沙箱(workspace-write)里家目录通常在工作区外、不可写;如果只有家目录一个选择,
+    一次写入失败就会 traceback 拖垮整条命令(连检查结果都输不出来)。所以必须能依次回退。
+    """
+    import os, tempfile
+    cands = []
+    env = os.environ.get("DSH_GUARD_LOG")
+    if env:
+        cands.append(env)
+    cands.append(os.path.join(os.path.expanduser("~"), ".dsh-guard", "audit.jsonl"))
+    try:
+        cands.append(os.path.join(os.getcwd(), ".dsh-guard", "audit.jsonl"))
+    except Exception:
+        pass
+    cands.append(os.path.join(tempfile.gettempdir(), "dsh-guard", "audit.jsonl"))
+    return cands
+
 def _log_file():
+    """读取审计日志用:优先返回已存在的日志文件路径。"""
     import os
-    return os.environ.get("DSH_GUARD_LOG", os.path.join(os.path.expanduser("~"), ".dsh-guard", "audit.jsonl"))
+    if _LOG_PATH and os.path.exists(_LOG_PATH):
+        return _LOG_PATH
+    cands = _log_candidates()
+    for p in cands:
+        if os.path.exists(p):
+            return p
+    return cands[0]
 
 def osv_query(name, version=None):
     body = {"package": {"name": name, "ecosystem": "npm"}}
@@ -80,24 +124,53 @@ def _npm_doc(name):
     with urllib.request.urlopen(req, timeout=12) as r:
         return json.load(r)
 
+def _npm_version_doc(name, version):
+    """取单个版本的完整文档。
+
+    为什么不能用 install-v1 精简元数据:它**刻意省略** scripts 与每版本 dependencies,
+    于是 install_script_risk 里 ver.get("scripts") / ver.get("dependencies") 恒为空,
+    行为启发式(安装脚本 / 投毒依赖)永不触发 —— 实测 esbuild@0.24.2、core-js@3.36.0、
+    puppeteer@22.0.0 三个真含 postinstall 的包全部漏报。
+    /{name}/{version} 单版本文档体积小、字段全,是这里正确的取法。
+    """
+    req = urllib.request.Request(
+        f"https://registry.npmjs.org/{name}/{version}",
+        headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=12) as r:
+        return json.load(r)
+
 def install_script_risk(name, version):
     """查 npm 元数据里安装期脚本/可疑依赖 → (flags, detail)"""
-    try:
-        doc = _npm_doc(name)
-    except Exception as e:
-        return ([], f"npm 元数据获取失败: {e}")
     flags = []
-    ver = doc.get("versions", {}).get(version, {})
+    note = ""
+    ver = {}
+    # ① 首选:单版本完整文档(含 scripts / dependencies)
+    if version:
+        try:
+            ver = _npm_version_doc(name, version)
+        except Exception as e:
+            note = f"单版本元数据获取失败({e}),已退到精简元数据"
+    # ② 退化:精简元数据(至少能给出 hasInstallScript)
+    if not isinstance(ver, dict) or not ver:
+        try:
+            ver = _npm_doc(name).get("versions", {}).get(version, {}) or {}
+        except Exception as e:
+            return ([], f"npm 元数据获取失败: {e}")
+    if not isinstance(ver, dict):
+        ver = {}
     scripts = ver.get("scripts", {}) or {}
     for f in _SCRIPT_FIELDS:
         if f in scripts:
             flags.append(f"含 {f} 脚本(安装时执行代码,高风险)")
+    # 兜底:精简元数据只带 hasInstallScript 布尔值,拿不到脚本名时也要提示出来
+    if not scripts and ver.get("hasInstallScript"):
+        flags.append("含安装期脚本(元数据仅给出 hasInstallScript,未取到脚本名)")
     deps = set((ver.get("dependencies") or {})) | set((ver.get("devDependencies") or {}))
     for d in deps:
         dl = d.lower()
         if dl in ("@antv/setup",) or "shai-hulud" in dl or "harkonnen" in dl:
             flags.append(f"依赖可疑投毒标记包 {d}")
-    return (flags, "")
+    return (flags, note)
 
 def check_supply(name, version):
     if not version:
@@ -115,7 +188,8 @@ def check_supply(name, version):
         else:
             osv_verdict = ("allow", "无已知告警")
     except Exception as e:
-        osv_verdict = ("warn", f"OSV 查询失败(网络?) {e}")
+        # 网络失败 ≠ 安全:明确区分"确认无害"与"无法确认",避免下游把它当成 allow 放行
+        osv_verdict = ("unknown", f"无法确认(OSV 查询失败,可能断网): {_sanitize(str(e), 80)}")
     verdict, detail = osv_verdict
     # ② 行为启发式(即使 OSV 无记录也可能抓住)
     bflags, bdetail = install_script_risk(name, version)
@@ -130,6 +204,15 @@ def check_supply(name, version):
 
 # ─────────────────────────── 契约检查(node --check + 正则)───────────────────────────
 import re as _re, subprocess as _sp, os as _os
+
+# 统一输出编码:中文 Windows 控制台默认 GBK,emoji/特殊字符会直接崩掉整条命令(或 ui 启动)
+try:
+    import sys as _sys
+    _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 def _norm_path(p):
     """git-bash 的 /c/Users/... → Windows 的 C:/Users/... (仅当 MSYS 形式存在时)"""
@@ -170,7 +253,10 @@ def _find_await_bug(src, path):
             child = _ts_is_async(node)
         for c in node.named_children:
             walk(c, child)
-    walk(tree.root_node, False)
+    # 顶层 await 在 ES module 里完全合法（插件常见写法：export const m = await import(...)），
+    # 所以 Program 根按“合法上下文”起步，只有进入非 async 的**函数体**才报错。
+    # （CJS 里非法的顶层 await 由 node --check 的 commonjs 复核兜住，不会漏。）
+    walk(tree.root_node, True)
     return hits
 
 def _node():
@@ -183,26 +269,114 @@ def _node():
             return cand
     return "node"
 
+_NODE_MISSING = "@@node-missing@@"   # node 不可用时返回此标记,由调用方转为显式 warn
+
 def _node_check(path):
+    """语法检查。
+
+    注意：不要用 `node --check <file>` —— Node 对 .js 文件会走 CommonJS 校验路径，
+    遇到 ESM 语法（export/import）时**跳过语法校验**，导致坏文件被静默放行（rc=0）。
+    而 dsh 插件恰好全是 "type":"module" 的 .js，所以那条路径恰好在最该生效的场景失效。
+
+    改为：把源码从 stdin 喂进去按 module 模式检查；若不通过，再按 commonjs 复核
+    （避免误报纯 CJS 文件）—— 任一模式通过即视为语法合法。
+    """
     try:
-        r = _sp.run([_node(), "--check", path], capture_output=True, text=True)
-    except (FileNotFoundError, OSError):
-        return None  # node 可选:缺失时跳过权威语法检查(tree-sitter 仍覆盖 await 检查)
-    if r.returncode != 0:
-        err = (r.stderr or r.stdout).strip().splitlines()
-        return f"node --check 失败:{err[-1][:130] if err else '语法错误'}"
+        src = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    first_err = None
+    for mode in ("module", "commonjs"):
+        try:
+            # encoding 必须显式 utf-8：否则会跟随系统 locale（中文 Windows = cp936），
+            # 源码里的 ¥ / emoji / 中文标识符会让 stdin 编码直接崩（UnicodeEncodeError，零输出）。
+            r = _sp.run([_node(), "--check", "--input-type=" + mode],
+                        input=src, capture_output=True, encoding="utf-8", errors="replace")
+        except (FileNotFoundError, OSError):
+            # node 不可用 → 语法检查整类会静默失效。这属于 fail-open,必须显式告知调用方
+            return _NODE_MISSING
+        if r.returncode == 0:
+            return None
+        if first_err is None:
+            lines = [l.strip() for l in (r.stderr or r.stdout).strip().splitlines() if l.strip()]
+            # 优先挑带 Error 的那行(末行通常只是 "Node.js v22.x",没有信息量)
+            first_err = next((l for l in lines if "Error" in l), lines[0] if lines else "语法错误")
+    return f"node --check 失败:{first_err[:130]}"
+
+def _object_around(src, pos):
+    """向前找最近的 '{'，再用括号配平（跳过字符串与注释）取回整个对象字面量的文本。
+
+    用于 keyed-slot 的 key 检查：原先用固定 400 字符窗口，key 稍远（中间有大段注释）就误报缺 key。
+    取不到返回 None。
+    """
+    start = src.rfind("{", max(0, pos - 300), pos)
+    if start == -1:
+        return None
+    depth = 0
+    i = start
+    n = len(src)
+    quote = None
+    while i < n:
+        c = src[i]
+        if quote:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in "\"'`":
+            quote = c
+        elif c == "/" and i + 1 < n and src[i + 1] == "/":
+            nl = src.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        elif c == "/" and i + 1 < n and src[i + 1] == "*":
+            end = src.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:i + 1]
+        i += 1
     return None
+
+MAX_CHECK_BYTES = 5 * 1024 * 1024   # 超过 5MB 不做完整检查(避免读爆内存 / AST 爆栈)
 
 def check_file(path, is_client=False):
     path = _norm_path(path)
-    src = open(path, encoding="utf-8").read()
     findings = []
+    # 入口防护:路径与文件内容都来自不可信输入(agent/用户),任何异常都不能让调用方崩 ——
+    # CLI 零输出、MCP 服务死亡都属于 fail-open,比"返回一个错误结论"危险得多。
+    if not _os.path.exists(path):
+        return [("error", f"路径不存在: {_sanitize(path, 120)}")], ""
+    if _os.path.isdir(path):
+        return [("error", f"是目录而非文件: {_sanitize(path, 120)}")], ""
+    try:
+        size = _os.path.getsize(path)
+    except OSError as e:
+        return [("error", f"无法读取文件属性: {_sanitize(str(e), 120)}")], ""
+    if size > MAX_CHECK_BYTES:
+        return [("unknown", f"文件过大({size // 1048576}MB),检查未完成")], ""
+    try:
+        # errors="replace":二进制 / 非 UTF-8 内容不能让检查崩掉
+        src = open(path, encoding="utf-8", errors="replace").read()
+    except OSError as e:
+        return [("error", f"读取失败: {_sanitize(str(e), 120)}")], ""
     # 1) 语法 + await-in-non-async: 交给 node --check(权威,支持现代 JS)
     nerr = _node_check(path)
-    if nerr:
+    if nerr == _NODE_MISSING:
+        findings.append(("unknown", "node 不可用,语法检查未完成(结论不可信)"))
+    elif nerr:
         findings.append(("error", nerr))
-    for hit in _find_await_bug(src, path):
-        findings.append(("error", hit))
+    try:
+        for hit in _find_await_bug(src, path):
+            findings.append(("error", hit))
+    except RecursionError:
+        # 深层嵌套(混淆代码常见)会撑爆 Python 递归 → 降级跳过本项,绝不冒泡
+        findings.append(("unknown", "AST 嵌套过深,await 检查未完成(疑似混淆代码)"))
     # 2) inject 白名单(只对 inject 数组,server/client 分半)
     allowed = CLIENT_INJECT if is_client else SERVER_INJECT
     half = "client" if is_client else "server"
@@ -210,12 +384,10 @@ def check_file(path, is_client=False):
         for n in _re.findall(r"['\"]([A-Za-z]+)['\"]", m.group(1)):
             if n not in allowed:
                 findings.append(("warn", f"inject 含 '{n}' 不在白名单({half}半)"))
-    # 3) keyed-slot 缺 key
+    # 3) keyed-slot 缺 key(用括号配平定位整个对象,不用固定字符窗口 —— 否则 key 稍远就误报)
     for m in _re.finditer(r"name:\s*['\"](settings\.(?:plugin|general)\.item)['\"]", src):
-        chunk = src[m.end():m.end()+400]
-        obj_end = chunk.find("}")
-        obj = chunk[:obj_end] if obj_end != -1 else chunk
-        if "key:" not in obj:
+        obj = _object_around(src, m.start())
+        if obj is not None and not _re.search(r"(?:^|[{,\s])key\s*:", obj):
             findings.append(("warn", f"keyed-slot {m.group(1)} 缺显式 key(报 requires options.key)"))
     # 4) adapter 缺 prepareCall(识 compat 包装)
     if "registerAdapter" in src and "prepareCall" not in src \
@@ -227,55 +399,242 @@ def check_file(path, is_client=False):
 # block=投毒标记;warn(单独)=高危单信号(shell/eval/读密钥);warn(组合)=中危(net+secret/net+shell);忽略=真良性(setInterval/裸fetch/裸atob)
 HOSTILE_MARKER = [r"kitty-monitor", r"harkonnen", r"melange", r"/bin/sh\s+-c", r"\bnc\s+-e"]
 HOSTILE_HIGH = {
-    "shell_exec":    [r"child_process\.(exec|execSync|spawn|spawnSync)|require\(['\"]child_process['\"]\)"],
+    # exec/execSync 与 execFile 风险不同(execFile 不走 shell、参数以数组传递)→ 加负向前瞻,
+    # 否则 "child_process.execFile" 会被 "exec" 前缀吃掉,真实插件实测误报。
+    "shell_exec":    [r"child_process\.(?:exec|execSync|spawn|spawnSync)(?![\w$])"],
     "arbitrary_eval":[r"\beval\s*\(|\bnew\s+Function\s*\(|\bFunction\s*\("],
-    "secret_read":   [r"process\.env\.(?:AWS_|GITHUB|OPENAI|ANTHROPIC|NPM|DEEPSEEK|GOOGLE|AZURE|TOKEN|API_KEY|SECRET|PASSWORD)|toJSON\(secrets\)|credentials\.ya?ml|auth\.json"],
+    # 只认"名字本身就是密钥"的变量:裸厂商前缀会把 DEEPSEEK_BASE_URL(地址)也算进来。
+    # 泛 process.env 一律不报(README 已把"泛 process.env"列为良性)。
+    "secret_read":   [r"process\.env\.[A-Za-z0-9_]*?(?:API_?KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|ACCESS_KEY)[A-Za-z0-9_]*|toJSON\(secrets\)|credentials\.ya?ml|auth\.json"],
 }
 HOSTILE_NET = [r"require\(['\"](?:http|https|net|dgram|tls)['\"]\)|/dev/tcp/|\bcurl\s+|\bfetch\(|WebClient|DownloadString"]
 HOSTILE_PERSIST = [r"cron\.schedule|\bRun Copilot\b|schtasks|/etc/cron|Registry\\\\.*Run"]
+
+def _strip_noise(src, keep_strings=False):
+    """把注释与字符串内容抹成等长空白(保留换行,行号仍对齐),只留真实代码。
+
+    keep_strings=True:只抹注释、保留字符串内容 —— 供"引入了哪个模块"这类需要读字面量
+    的判定使用(模块名是代码语义,不是噪音)。
+
+
+    为什么必须做:正则直接跑原始全文时,注释里写一句 "child_process.exec is dangerous"
+    就会报 warn —— 实测真实插件集 196 个命中里 34 个(17%)落在注释/字符串内。
+    更要命的是"组合信号":注释里提一句 auth.json 就能拼出"读密钥+网络(疑似窃密)",
+    与真的读 API_KEY 往外发**输出逐字相同**,最高危信号因此完全失去区分度。
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    NL = chr(10)
+    BS = chr(92)
+    st = "code"
+    while i < n:
+        c = src[i]
+        nx = src[i + 1] if i + 1 < n else ""
+        if st == "code":
+            if c == "/" and nx in ("/", "*"):
+                st = "line" if nx == "/" else "block"
+                out[i] = out[i + 1] = " "
+                i += 2
+                continue
+            if c in ("'", '"', "`"):
+                st = {"'": "sq", '"': "dq", "`": "tpl"}[c]
+                if not keep_strings:
+                    out[i] = " "
+                i += 1
+                continue
+        elif st == "line":
+            if c == NL:
+                st = "code"
+            else:
+                out[i] = " "
+        elif st == "block":
+            if c == "*" and nx == "/":
+                out[i] = out[i + 1] = " "
+                i += 2
+                st = "code"
+                continue
+            if c != NL:
+                out[i] = " "
+        else:   # sq / dq / tpl
+            q = {"sq": "'", "dq": '"', "tpl": "`"}[st]
+            if c == BS:                      # 转义序列:内容一并抹掉
+                if not keep_strings:
+                    out[i] = " "
+                    if i + 1 < n and src[i + 1] != NL:
+                        out[i + 1] = " "
+                i += 2
+                continue
+            if c == q:
+                if not keep_strings:
+                    out[i] = " "
+                st = "code"
+                i += 1
+                continue
+            if c != NL and not keep_strings:
+                out[i] = " "
+        i += 1
+    return "".join(out)
+
+
+def _cp_exec_import_line(src):
+    """引入 child_process 且引入的是**走 shell** 的变体(exec/execSync)时的行号,否则 None。
+
+    为什么不能"见到 require('child_process') 就报":execFile/spawn 不走 shell、参数以数组传递,
+    风险与 exec 不同 —— 真人插件里 execFile 很常见,一律报就是误报(REPORT5 的 m3)。
+    覆盖两种真实写法:
+      解构:const {exec, spawn} = require('child_process')    → 看解构名里有没有 exec/execSync
+      别名:const cp = require('child_process'); cp.exec(…)    → 看别名变量有没有被 .exec( 调用
+    注意 JS 里 RegExp.prototype.exec 极其常见,所以只在"确认与 child_process 别名绑定"后才报,
+    绝不裸报 \bexec\(。
+    """
+    NL = chr(10)
+    for m in _re.finditer(r"\{([^}]*)\}\s*=\s*require\s*\(\s*['\"](?:node:)?child_process['\"]", src):
+        if _re.search(r"\b(?:exec|execSync)\b", m.group(1)):
+            return src.count(NL, 0, m.start()) + 1
+    for m in _re.finditer(r"\b([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['\"](?:node:)?child_process['\"]", src):
+        var = m.group(1)
+        if _re.search(r"\b" + _re.escape(var) + r"\s*\.\s*(?:exec|execSync)(?![\w$])", src):
+            return src.count(NL, 0, m.start()) + 1
+    return None
+
+
+def _shell_command_has_net(src):
+    """exec('curl …') 这类:命令字符串是"真会执行的东西",不算噪音。
+
+    剥离器抹字符串是为了防"注释里提一句 curl 就误报",但 exec/execSync 的参数恰恰是真命令 ——
+    这里单独把参数取出来判网络行为,兼顾两头。
+    """
+    for m in _re.finditer(r"\b(?:exec|execSync)\s*\(\s*(['\"])((?:\\.|(?!\1).)*?)\1", src):
+        if _re.search(r"\b(?:curl|wget|ncat|nc|/dev/tcp)\b", m.group(2)):
+            return True
+    return False
+
+
+def _hit_line(src, pats):
+    """第一条命中的行号(1-based),没命中返回 None。
+
+    告警必须带行号+可自查的位置:否则用户只看到一个文件名,无法判断真伪,
+    自然就学会了无视告警。
+    """
+    for pat in pats:
+        m = _re.search(pat, src)
+        if m:
+            return src.count(chr(10), 0, m.start()) + 1
+    return None
+
+
+MAX_SCAN_FILES = 2000   # 目录扫描的文件数上限(防止 scan 一个大目录吃满内存/时间)
 
 def _hostile_scan(path):
     import os
     path = _norm_path(path)
     if os.path.isdir(path):
-        files = [os.path.join(dp, f) for dp, _, fs in os.walk(path) for f in fs if f.endswith((".js", ".mjs", ".cjs"))]
+        files = []
+        truncated = False
+        for dp, dirs, fs in os.walk(path):
+            # 剪枝:不进入插件自带的 node_modules —— 第三方依赖的代码不该算在插件头上
+            # (实测某插件自身只有 18 个 .js,目录里却含 246 个嵌套依赖 .js)
+            if "node_modules" in dirs:
+                dirs.remove("node_modules")
+            for f in fs:
+                if f.endswith((".js", ".mjs", ".cjs")):
+                    if len(files) >= MAX_SCAN_FILES:
+                        truncated = True
+                        break
+                    files.append(os.path.join(dp, f))
+            if truncated:
+                break
     else:
         files = [path]
+        truncated = False
     hits = []
+    if truncated:
+        hits.append(("warn", f"文件数超过上限,仅扫描前 {MAX_SCAN_FILES} 个", path))
     for f in files:
+        # 单文件大小上限:与 check-file 同一把尺子(此前 scan 无界:50MB → 171MB 内存)
+        try:
+            if os.path.getsize(f) > MAX_CHECK_BYTES:
+                hits.append(("warn", f"文件过大({os.path.getsize(f) // 1048576}MB),跳过扫描", f))
+                continue
+        except OSError:
+            continue
         try:
             src = open(f, encoding="utf-8", errors="replace").read()
         except Exception:
             continue
-        if any(_re.search(p, src) for p in HOSTILE_MARKER):
-            hits.append(("error", "投毒/外传标记", f))
-        for name, pats in HOSTILE_HIGH.items():
-            if any(_re.search(p, src) for p in pats):
-                hits.append(("warn", f"高危单信号:{name}", f))
-        has_net = any(_re.search(p, src) for p in HOSTILE_NET)
-        has_shell = any(_re.search(p, src) for p in HOSTILE_HIGH["shell_exec"])
-        has_secret = any(_re.search(p, src) for p in HOSTILE_HIGH["secret_read"])
-        if has_net and has_secret:
-            hits.append(("warn", "读密钥+网络(疑似窃密)", f))
-        if has_net and has_shell:
-            hits.append(("warn", "shell+网络(疑似外传)", f))
-        if any(_re.search(p, src) for p in HOSTILE_PERSIST):
-            hits.append(("warn", "持久化/后门迹象", f))
+        # 两遍剥离,各行其职:
+        #   code   —— 注释+字符串都抹掉,用来判"代码干了什么"(字符串里写 exec 不算行为)
+        #   code_s —— 只抹注释,保留字符串,用来判"引入了哪个模块"(模块名是语义,不是噪音)
+        code = _strip_noise(src)
+        code_s = _strip_noise(src, keep_strings=True)
+        # 投毒标记本身就是"引用了哪个包名",必然出现在字符串里 → 用 code_s(注释已抹、字符串保留)
+        ln = _hit_line(code_s, HOSTILE_MARKER)
+        if ln:
+            hits.append(("error", f"投毒/外传标记(第 {ln} 行)", f))
+        # shell_exec:调用式(child_process.exec…)或引入式(require('child_process'))任一命中
+        ln_shell = _hit_line(code, HOSTILE_HIGH["shell_exec"]) or _cp_exec_import_line(code_s)
+        ln_eval = _hit_line(code, HOSTILE_HIGH["arbitrary_eval"])
+        ln_secret = _hit_line(code, HOSTILE_HIGH["secret_read"])
+        if ln_shell:
+            hits.append(("warn", f"高危单信号:shell_exec(第 {ln_shell} 行)", f))
+        if ln_eval:
+            hits.append(("warn", f"高危单信号:arbitrary_eval(第 {ln_eval} 行)", f))
+        if ln_secret:
+            hits.append(("warn", f"高危单信号:secret_read(第 {ln_secret} 行)", f))
+        has_net = _hit_line(code, HOSTILE_NET) is not None or _shell_command_has_net(code_s)
+        # 组合信号:两个信号现在都来自真实代码,注释凑不出"疑似窃密"
+        if has_net and ln_secret:
+            hits.append(("warn", f"读密钥+网络(疑似窃密;密钥在第 {ln_secret} 行)", f))
+        if has_net and ln_shell:
+            hits.append(("warn", f"shell+网络(疑似外传;shell 在第 {ln_shell} 行)", f))
+        ln = _hit_line(code, HOSTILE_PERSIST)
+        if ln:
+            hits.append(("warn", f"持久化/后门迹象(第 {ln} 行)", f))
     return hits
 
 # ─────────────────────────── MCP server(--mcp,纯 stdlib)───────────────────────────
+def _sanitize(s, limit=200):
+    """把来自外部输入的内容净化成安全单行文本。
+
+    必要性:MCP 的结论是给人/agent 读的纯文本。若外部输入(包名/路径/报错)原样拼进去,
+    输入里的换行就能**伪造出额外的结论行**(实测可凭空多一行 "[ALLOW] 供应链: 无已知告警")。
+    安全门最不该有的缺陷就是"可以被问它的问题操纵"。
+    """
+    import unicodedata
+    out = []
+    for ch in str(s):
+        # 覆盖 C0/C1 控制符 + Unicode 行分隔符(U+2028/U+2029/U+0085):
+        # 只判 ch < " " 是不够的 —— U+2028 等仍会被 splitlines() 当成换行,伪造依旧成立。
+        if ch in ("\u2028", "\u2029", "\u0085") or unicodedata.category(ch)[0] == "C":
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)[:limit]
+    return s[:limit]
+
 def _mcp_result_obj(package, path, client):
-    """跑供应链 + 可选契约,返回结构化结果"""
+    """跑供应链 + 可选契约,返回结构化结果(供 MCP 返回)。"""
     name, ver = parse_pkg(package)
     v, d = check_supply(name, ver)
-    lines = [f"[{v.upper()}] 供应链: {d}"]
-    file_findings = []
+    lines = [f"[{v.upper()}] 供应链: {_sanitize(d, 300)}"]
+    # 注意:三个标志都要在 if 外初始化 —— 否则"只查包名不带 path"时 has_unfinished 未定义,
+    # 触发 UnboundLocalError(而这恰是 agent 最常用的调用方式)。
+    file_findings, has_contract_error, has_unfinished = [], False, False
     if path:
         file_findings, _ = check_file(path, client)
+        has_contract_error = any(l == "error" for l, _ in file_findings)
+        has_unfinished = any(l == "unknown" for l, _ in file_findings)
         for lvl, msg in file_findings:
-            lines.append(f"[{lvl.upper()}] 契约: {msg}")
-    return {"verdict": v, "detail": d, "contract": file_findings,
-            "text": "\n".join(lines)}
+            lines.append(f"[{lvl.upper()}] 契约: {_sanitize(msg, 300)}")
+    return {
+        "verdict": v,
+        "detail": d,
+        "contract": file_findings,
+        # isError 必须把契约 error 也算进去:否则语法坏掉的插件会拿到 isError:false,
+        # 靠 isError 判断的 MCP 客户端会以为"调用成功、无问题"
+        "isError": (v in ("block", "unknown")) or has_contract_error or has_unfinished,
+        "text": "\n".join(lines),
+    }
 
 def serve_mcp():
     """Run as a stdio MCP server (JSON-RPC 2.0, newline-delimited)."""
@@ -296,6 +655,31 @@ def serve_mcp():
             "required": ["package"],
         },
     }
+    def _dispatch(msg):
+        """处理单条 JSON-RPC 消息。异常由调用方兜住 —— 主循环绝不退出。"""
+        method = msg.get("method")
+        rid = msg.get("id")
+        if method == "initialize":
+            return {"jsonrpc": "2.0", "id": rid, "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}}, "serverInfo": {"name": "dsh-guard", "version": __version__}}}
+        if method == "notifications/initialized" or (method or "").startswith("notifications"):
+            return None
+        if method == "tools/list":
+            return {"jsonrpc": "2.0", "id": rid, "result": {"tools": [TOOL]}}
+        if method == "tools/call":
+            params = msg.get("params", {})
+            name = params.get("name")
+            args = params.get("arguments", {})
+            if name != "dsh_guard_check":
+                return {"jsonrpc": "2.0", "id": rid, "result": {
+                    "content": [{"type": "text", "text": f"unknown tool {_sanitize(name)}"}], "isError": True}}
+            out = _mcp_result_obj(args.get("package", ""), args.get("path"), bool(args.get("client")))
+            return {"jsonrpc": "2.0", "id": rid, "result": {
+                "content": [{"type": "text", "text": out["text"]}],
+                "isError": bool(out["isError"])}}
+        return {"jsonrpc": "2.0", "id": rid, "result": {}}
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -304,32 +688,21 @@ def serve_mcp():
             msg = json.loads(line)
         except Exception:
             continue
-        method = msg.get("method")
         rid = msg.get("id")
-        if method == "initialize":
+        try:
+            resp = _dispatch(msg)
+        except Exception as e:
+            # 关键防护:任何异常都回一条 error 响应,主循环绝不退出。
+            # 否则一次坏输入(例如传了不存在的路径)就能打死守门服务,此后所有调用全部 fail-open。
             resp = {"jsonrpc": "2.0", "id": rid, "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}}, "serverInfo": {"name": "dsh-guard", "version": __version__}}}
-        elif method == "notifications/initialized" or msg.get("method", "").startswith("notifications"):
-            resp = None
-        elif method == "tools/list":
-            resp = {"jsonrpc": "2.0", "id": rid, "result": {"tools": [TOOL]}}
-        elif method == "tools/call":
-            params = msg.get("params", {})
-            name = params.get("name")
-            args = params.get("arguments", {})
-            if name != "dsh_guard_check":
-                resp = {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": f"unknown tool {name}"}], "isError": True}}
-            else:
-                out = _mcp_result_obj(args.get("package", ""), args.get("path"), bool(args.get("client")))
-                resp = {"jsonrpc": "2.0", "id": rid, "result": {
-                    "content": [{"type": "text", "text": out["text"]}],
-                    "isError": out["verdict"] == "block"}}
-        else:
-            resp = {"jsonrpc": "2.0", "id": rid, "result": {}}
+                "content": [{"type": "text", "text": f"[ERROR] dsh-guard 内部错误: {_sanitize(str(e))}"}],
+                "isError": True}}
         if resp is not None:
-            sys.stdout.write(json.dumps(resp) + "\n")
-            sys.stdout.flush()
+            try:
+                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
 
 # ─────────────────────────── 守门后放行(G4 safe-add)───────────────────────────
 def _safe_add(pkg, path, client, delegate, yes=False):
@@ -339,14 +712,33 @@ def _safe_add(pkg, path, client, delegate, yes=False):
     print(f"[{v.upper()}] 供应链: {d}")
     findings = []
     if path:
-        findings, _ = check_file(path, client)
-        for lvl, msg in findings:
+        # ① 契约检查
+        contract, _ = check_file(path, client)
+        for lvl, msg in contract:
             print(f"[{lvl.upper()}] 契约: {msg}")
+        findings += contract
+        # ② 源码敌意扫描 —— 此前漏接:safe-add 只做契约检查,
+        #    于是含 child_process.exec / 读密钥 / eval 的文件照样被判 SAFE 放行。
+        hostile = [("error" if l == "error" else "warn", f"{k} ({_os.path.basename(f)})")
+                   for l, k, f in _hostile_scan(path)]
+        for lvl, msg in hostile:
+            print(f"[{lvl.upper()}] 源码: {msg}")
+        findings += hostile
+
+    # 「没查成」≠「没问题」:unknown 表示检查未完成,一律硬拒,且 --yes 不能覆盖。
+    # 否则网络失败 / 文件过大 / node 缺失 / 嵌套过深 这些降级路径,会变成攻击者的默认路径
+    # (agent 的常规用法就是带 --yes)。
+    has_unfinished = v == "unknown" or any(l == "unknown" for l, _ in findings)
     has_error = v == "block" or any(l == "error" for l, _ in findings)
-    if has_error:
-        print("REFUSED → 未通过检查,不执行安装。")
-        audit({"cmd": "safe-add", "target": pkg, "path": path, "verdict": "block", "detail": d})
+    if has_error or has_unfinished:
+        if has_error:
+            print("REFUSED → 发现问题,不执行安装。")
+            audit({"cmd": "safe-add", "target": pkg, "path": path, "verdict": "block", "detail": d})
+        else:
+            print("REFUSED → 检查未能完成,结果不可信,不执行安装。（--yes 不能覆盖未完成的检查）")
+            audit({"cmd": "safe-add", "target": pkg, "path": path, "verdict": "unknown", "detail": d})
         return 1
+
     has_warn = v == "warn" or any(l == "warn" for l, _ in findings)
     if has_warn and delegate and not yes:
         import sys as _sys
@@ -400,7 +792,14 @@ def _major_jump(b, a):
             return None
         if not p:
             return None
-        return p[1] if (p[0] == 0 and len(p) > 1) else p[0]
+        # 量纲归一化后再比较:
+        #   0.x  → (0, minor)   —— 0.x 项目里 minor 变化才是"事实上的大版本"
+        #   1.x+ → (1, major)   —— 进入正式版后只看 major
+        # 旧写法"0.x 返回 minor、否则返回 major"是混合量纲:0.9.0 → 9,1.0.0 → 1,
+        # 比出 1 > 9 = False,恰好漏掉 0.x→1.x 这个最剧烈的破坏性升级;
+        # 而 1.0.0→0.9.0(降级)反被误报成跳变。
+        # 也不能直接用 (major, minor):那样 1.0.0→1.5.0 会被误报(实际只是 minor 升级)。
+        return (0, p[1] if len(p) > 1 else 0) if p[0] == 0 else (1, p[0])
     mb, ma = mj(b), mj(a)
     if mb is None or ma is None:
         return False
@@ -534,8 +933,25 @@ def serve_ui(port=8170):
         def _host_ok(self):
             h = self.headers.get("Host", "")
             return h in ("127.0.0.1:%s" % port, "localhost:%s" % port)
+        def _origin_ok(self):
+            """CSRF 防护:浏览器的跨站请求一定带 Origin/Referer,必须校验为本机 UI。
+
+            否则任意恶意网页都能 POST /api/consent,往审计日志里塞"放行"假记录,污染证据链
+            (dsh 实测:Content-Type: text/plain 可绕过 CORS 预检,浏览器会真的发出去)。
+            无 Origin/Referer 的是本机命令行客户端(如 curl),不构成 CSRF,放行。
+            """
+            local = ("http://127.0.0.1:%s" % port, "http://localhost:%s" % port)
+            origin = self.headers.get("Origin")
+            if origin is not None:
+                return origin in local
+            referer = self.headers.get("Referer")
+            if referer is not None:
+                return referer.startswith(local)
+            return True
         def do_GET(self):
-            if not self._host_ok():
+            # GET 同样是副作用入口(会发起网络查询、读任意路径文件、起 node 子进程),
+            # 跨站可盲触发做探测/DoS → 与 POST 一样校验 Origin
+            if not self._host_ok() or not self._origin_ok():
                 self.send_response(403); self.end_headers(); return
             u = urllib.parse.urlparse(self.path)
             if u.path == "/":
@@ -549,7 +965,7 @@ def serve_ui(port=8170):
                 self._send(json.dumps(_read_audit(flt), ensure_ascii=False).encode("utf-8")); return
             self.send_response(404); self.end_headers()
         def do_POST(self):
-            if not self._host_ok():
+            if not self._host_ok() or not self._origin_ok():
                 self.send_response(403); self.end_headers(); return
             if self.path == "/api/consent":
                 ln = int(self.headers.get("Content-Length", 0))
@@ -595,7 +1011,7 @@ def main():
             _jsonout({"cmd": "check", "target": args.pkg, "verdict": v, "detail": d})
         else:
             print(f"[{v.upper()}] 供应链: {d}")
-        sys.exit(0 if v != "block" else 1)
+        sys.exit(0 if v not in ("block", "unknown") else 1)
     elif args.cmd == "check-file":
         fnd, _ = check_file(args.path, args.client)
         ver = "error" if any(l == "error" for l, _ in fnd) else ("warn" if fnd else "allow")
