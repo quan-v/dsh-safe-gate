@@ -50,14 +50,14 @@ No npm, no PyPI account needed. Three ways:
 
 ```bash
 # 1. Run straight from GitHub (recommended)
-uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.6"
+uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.7"
 
 # 2. pip from GitHub
-pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.6"
+pip install "git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.7"
 
 # 3. Clone and run (zero install, most transparent)
 git clone https://github.com/quan-v/dsh-safe-gate.git
-cd dsh-safe-gate && git checkout v0.1.6 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
+cd dsh-safe-gate && git checkout v0.1.7 && python dsh_guard.py check "@antv/mcp-server-chart@0.11.10"
 ```
 
 > **Naming:** the repo is dsh-safe-gate, the tool/command is dsh-guard — same project. Install URLs use the repo name, the CLI is dsh-guard.
@@ -100,7 +100,7 @@ Append `--json` to any command for machine-readable output.
 ## As an MCP tool (into dsh)
 
 ```bash
-dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.6" --mcp
+dsh mcp add dsh-guard -- uvx "dsh-guard @ git+https://github.com/quan-v/dsh-safe-gate.git@v0.1.7" --mcp
 ```
 
 Then dsh's agent can call the `dsh_guard_check` tool — ask it before installing any plugin/MCP server.

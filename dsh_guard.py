@@ -21,7 +21,7 @@ SERVER_INJECT = {"tools", "settings", "llm"}
 CLIENT_INJECT = {"settingsScope", "slots", "locale", "agent", "storage",
                  "connection", "conversation", "modelSelection", "ui"}
 OSV_URL = "https://api.osv.dev/v1/query"
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 # ─────────────────────────── 包名解析 ───────────────────────────
 def parse_pkg(s):
@@ -720,7 +720,6 @@ def _sanitize(s, limit=200):
         else:
             out.append(ch)
     return "".join(out)[:limit]
-    return s[:limit]
 
 def _mcp_result_obj(package, path, client):
     """跑供应链 + 可选契约,返回结构化结果(供 MCP 返回)。"""
@@ -958,7 +957,7 @@ button{background:#2f6fed;color:#fff;border:0;padding:8px 16px;border-radius:8px
 .verdict{margin-top:16px;padding:16px;border-radius:10px;border:1px solid}
 .allow{background:#12261a;border-color:#1f7a3d;color:#63d08a}.warn{background:#261d0e;border-color:#c08a1f;color:#e0b054}.block{background:#2a1215;border-color:#c0392b;color:#ff8a80}
 .finding{margin:6px 0;font-size:13px}.act{margin-top:16px;display:flex;gap:10px}.act button{border:1px solid #2a3040;background:transparent;color:#e6e8ee}.act .go{background:#1f7a3d}.act .no{background:#c0392b}
-table{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}th,td{padding:7px 8px;border-bottom:1px solid #2a3040;text-align:left;vertical-align:top}th{color:#9aa4b5;font-weight:600}.tag{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px}.tag.b{background:#c0392b;color:#fff}.tag.w{background:#c08a1f;color:#111}.tag.a{background:#1f7a3d;color:#fff}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}th,td{padding:7px 8px;border-bottom:1px solid #2a3040;text-align:left;vertical-align:top}th{color:#9aa4b5;font-weight:600}.tag{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px}.tag.b{background:#c0392b;color:#fff}.tag.w{background:#c08a1f;color:#111}.tag.a{background:#1f7a3d;color:#fff}.tag.u{background:#5a6478;color:#fff}
 .histfilter{display:flex;gap:8px;margin-bottom:10px}</style></head><body><div class="card">
 <h1>🛡️ dsh-guard 装前守门</h1>
 <div class="tabs"><button class="tab on" id="tab-check" onclick="show('check',this)">检查</button><button class="tab" id="tab-hist" onclick="show('hist',this)">历史</button></div>
@@ -970,17 +969,17 @@ table{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}th,td{p
 </div>
 <script>function show(v,btn){document.getElementById('check-view').style.display=v==='check'?'':'none';document.getElementById('hist-view').style.display=v==='hist'?'':'none';document.getElementById('tab-check').className='tab'+(v==='check'?' on':'');document.getElementById('tab-hist').className='tab'+(v==='hist'?' on':'');if(v==='hist')loadHist();}
 async function go(){const q=document.getElementById('q').value.trim(),m=document.getElementById('mode').value,o=document.getElementById('out');o.innerHTML='<div class="verdict" style="border-color:#3a4152;color:#9aa4b5">检查中…</div>';
-const r=await fetch('/api/check?q='+encodeURIComponent(q)+'&mode='+m);const d=await r.json();const cls=d.verdict==='block'?'block':(d.verdict==='warn'?'warn':'allow');
-const t={block:'🔴 BLOCK 拦截',warn:'🟡 WARN 需确认',allow:'🟢 ALLOW 通过'}[d.verdict]||d.verdict;
+const r=await fetch('/api/check?q='+encodeURIComponent(q)+'&mode='+m);const d=await r.json();const cls=d.verdict==='block'?'block':(d.verdict==='warn'?'warn':(d.verdict==='unknown'?'unknown':'allow'));
+const t={block:'🔴 BLOCK 拦截',warn:'🟡 WARN 需确认',allow:'🟢 ALLOW 通过',unknown:'△ 检查未完成 — 不可据此放行'}[d.verdict]||d.verdict;
 let h='<div class="verdict '+cls+'"><b>'+t+'</b> — '+esc(d.detail||'');(d.findings||[]).forEach(f=>h+='<div class="finding">'+esc(f)+'</div>');h+='</div><div class="act">';
-if(d.verdict==='block')h+='<button class="no" onclick="c(\'block\')">拦截：不予安装</button>';else if(d.verdict==='warn')h+='<button class="go" onclick="c(\'allow\')">确认继续</button><button class="no" onclick="c(\'block\')">终止</button>';else h+='<button class="go" onclick="c(\'allow\')">确认</button>';h+='</div>';o.innerHTML=h;}
+if(d.verdict==='block')h+='<button class="no" onclick="c(\'block\')">拦截：不予安装</button>';else if(d.verdict==='unknown')h+='<button class="no" onclick="c(\'block\')">终止(检查未完成，不放行)</button>';else if(d.verdict==='warn')h+='<button class="go" onclick="c(\'allow\')">确认继续</button><button class="no" onclick="c(\'block\')">终止</button>';else h+='<button class="go" onclick="c(\'allow\')">确认</button>';h+='</div>';o.innerHTML=h;}
 function esc(s){return String(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 async function c(v){const q=document.getElementById('q').value;await fetch('/api/consent',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:q,decision:v})});document.getElementById('out').innerHTML='<div class="verdict allow">已记录你的决定：<b>'+(v==='allow'?'放行':'拦截')+'</b></div>';}
 async function loadHist(){const f=document.getElementById('hf').value.trim(),o=document.getElementById('hist');o.innerHTML='<div class="verdict" style="border-color:#3a4152;color:#9aa4b5">加载中…</div>';
 const r=await fetch('/api/history?f='+encodeURIComponent(f));const d=await r.json();
 if(!d.length){o.innerHTML='<div class="verdict" style="border-color:#3a4152;color:#9aa4b5">(暂无历史记录 — 先跑一次检查)</div>';return;}
 let h='<table><tr><th>时间</th><th>结论</th><th>命令</th><th>目标</th></tr>';
-d.forEach(e=>{const v=e.verdict||'',tag=v==='block'?'b':(v==='warn'?'w':'a'),label=v==='block'?'BLOCK':(v==='warn'?'WARN':'ALLOW');
+d.forEach(e=>{const v=e.verdict||'',tag=v==='block'?'b':(v==='warn'?'w':'a'),label=v==='block'?'BLOCK':(v==='warn'?'WARN':(v==='unknown'?'未完成':'ALLOW'));
 h+='<tr><td>'+esc(e.ts||'')+'</td><td><span class="tag '+tag+'">'+label+'</span></td><td>'+esc(e.cmd||'')+'</td><td>'+esc(e.target||'')+'</td></tr>';});
 h+='</table>';o.innerHTML=h;}
 </script></body></html>"""
@@ -1001,12 +1000,19 @@ def _api_check(q, mode):
             elif mode == "contract":
                 fnd, _ = check_file(p)
                 for l, m in fnd: findings.append(f"[{l}] {m}")
-                if any(l == "error" for l, _ in fnd): verdict = "block"
+                # 检查未完成(unknown)必须单独露出,不能悄悄留在默认的 allow
+                if any(l == "error" for l, _ in fnd):
+                    verdict = "block"
+                elif any(l == "unknown" for l, _ in fnd):
+                    verdict = "unknown"
                 detail = "契约检查"
             elif mode == "scan":
                 hits = _hostile_scan(p)
                 for l, k, f in hits: findings.append(f"[{l}] {k}: {os.path.basename(f)}")
-                if any(l == "error" for l, _, _ in hits): verdict = "block"
+                if any(l == "error" for l, _, _ in hits):
+                    verdict = "block"
+                elif any(l == "warn" for l, _, _ in hits):
+                    verdict = "warn"
                 detail = "源码敌意扫描"
     except Exception as e:
         verdict = "warn"; detail = f"检查异常: {e}"
@@ -1051,12 +1057,18 @@ def serve_ui(port=8170):
             无 Origin/Referer 的是本机命令行客户端(如 curl),不构成 CSRF,放行。
             """
             local = ("http://127.0.0.1:%s" % port, "http://localhost:%s" % port)
+
+            def _same_site(u):
+                # 必须"整个 authority 相同",不能只用 startswith:
+                # 否则 http://127.0.0.1:8170.evil.com 这种以本机地址开头的恶意域名也能混过。
+                return any(u == pre or u.startswith(pre + "/") for pre in local)
+
             origin = self.headers.get("Origin")
             if origin is not None:
                 return origin in local
             referer = self.headers.get("Referer")
             if referer is not None:
-                return referer.startswith(local)
+                return _same_site(referer)
             return True
         def do_GET(self):
             # GET 同样是副作用入口(会发起网络查询、读任意路径文件、起 node 子进程),
