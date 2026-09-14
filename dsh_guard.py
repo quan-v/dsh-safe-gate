@@ -21,7 +21,107 @@ SERVER_INJECT = {"tools", "settings", "llm"}
 CLIENT_INJECT = {"settingsScope", "slots", "locale", "agent", "storage",
                  "connection", "conversation", "modelSelection", "ui"}
 OSV_URL = "https://api.osv.dev/v1/query"
-__version__ = "0.1.7"
+__version__ = "0.1.8"
+
+_KNOWN_SERVICE_CACHE = None
+
+
+def _is_reparse_point(path):
+    """是不是符号链接 / Windows junction。
+
+    坑:Windows 的 junction **不是 symlink**,os.path.islink() 对它返回 False,
+    所以 os.walk(followlinks=False) 形同虚设 —— 实测一个指向扫描根之外的 junction
+    会让 scan 跟着它读出去(越界读取,而且那些路径还会被写进审计日志)。
+    junction 在 Windows 上带 FILE_ATTRIBUTE_REPARSE_POINT 位(0x400),用这个判。
+    """
+    try:
+        if _os.path.islink(path):
+            return True
+        st = _os.lstat(path)
+        return bool(getattr(st, "st_file_attributes", 0) & 0x400)
+    except Exception:
+        return False
+
+
+def _discover_services():
+    """从 dsh 已装的插件里现扫服务名,与内置基础名单合并。
+
+    为什么必须动态:dsh 是插件化架构,服务名是**开放集合** —— DSH 自带插件就用了 24 个
+    不同名字(实测),而硬编码白名单只有 12 个,于是真实插件 6/11 被判"不在白名单"。
+    硬编码必然滞后于生态,越补越漏。扫一遍已装插件,名单就自己跟上。
+    """
+    global _KNOWN_SERVICE_CACHE
+    if _KNOWN_SERVICE_CACHE is not None:
+        return _KNOWN_SERVICE_CACHE
+    names = set(SERVER_INJECT) | set(CLIENT_INJECT)
+    try:
+        import os as _os2
+        prof_dir = _os2.path.join(_os2.path.expanduser("~"), ".dsh", "profiles")
+        roots = []
+        if _os2.path.isdir(prof_dir):
+            for prof in _os2.listdir(prof_dir):
+                nm = _os2.path.join(prof_dir, prof, "node_modules")
+                if _os2.path.isdir(nm):
+                    roots.append(nm)
+        seen = 0
+        for root in roots:
+            base_depth = root.rstrip("\\/").count(_os2.sep)
+            for dp, dirs, fs in _os2.walk(root):
+                if dp.count(_os2.sep) - base_depth > 3:      # 只扫浅层,别陷进依赖深处
+                    dirs[:] = []
+                    continue
+                dirs[:] = [d for d in dirs
+                           if d not in (".bin", ".cache", "node_modules")
+                           and not _is_reparse_point(_os2.path.join(dp, d))]
+                for f in fs:
+                    if not f.endswith((".js", ".mjs", ".cjs")) or seen > 5000:
+                        continue
+                    fp = _os2.path.join(dp, f)
+                    try:
+                        if _os2.path.getsize(fp) > 2 * 1024 * 1024:
+                            continue
+                        txt = open(fp, encoding="utf-8", errors="replace").read()
+                    except Exception:
+                        continue
+                    seen += 1
+                    for m in _re.finditer(r"inject\s*=\s*\[([^\]]*)\]", txt):
+                        for n in _re.findall(r"['\"]([A-Za-z_$][\w$]*)['\"]", m.group(1)):
+                            names.add(n)
+    except Exception:
+        pass
+    _KNOWN_SERVICE_CACHE = names
+    return names
+
+
+def _edit_distance_one(a, b):
+    """a 与 b 是否只差一个字符(增/删/替)。"""
+    if a == b:
+        return False
+    if len(a) == len(b):
+        return sum(1 for x, y in zip(a, b) if x != y) == 1
+    if len(a) + 1 == len(b):
+        a, b = b, a
+    if len(a) != len(b) + 1:
+        return False
+    i = 0
+    while i < len(b) and a[i] == b[i]:
+        i += 1
+    return a[i + 1:] == b[i:]
+
+
+def _looks_like_typo(name, known):
+    """名字是否"像把某个已知服务名写错了"。
+
+    这条检查原来的判据是"不在白名单 ⇒ 有问题",但 dsh 的服务名是开放集合(硬编码 12 vs
+    实际 24),于是真实插件误报 55%。改成只在"与某个已知名字仅差一个字符"时提示 ——
+    那才是能确定有问题的情况(这种拼错会让 dsh 加载真的失败)。
+    名字对不上又不像拼错的(比如 fs / webServer):宁可漏,不误报。
+    """
+    for k in known:
+        if abs(len(k) - len(name)) <= 1 and _edit_distance_one(name, k):
+            return k
+    return None
+
 
 # ─────────────────────────── 包名解析 ───────────────────────────
 def parse_pkg(s):
@@ -36,6 +136,54 @@ def parse_pkg(s):
 
 # ─────────────────────────── OSV / 供应链 ───────────────────────────
 # ─────────────────────────── 审计日志(G6)───────────────────────────
+def _auto_audit_enabled():
+    """读 dsh 面板上那个"自动记录审计日志"开关,决定是否写审计。
+
+    这个开关住在 ~/.dsh/settings.yaml 的 dsh-guard-panel.autoAudit —— 而写日志的是
+    本工具。以前这里没人读它,于是开关纯属装饰:用户关掉了、日志照写。
+    默认开(true);读不出也当开(宁可多记,不可静默不记)。
+    """
+    try:
+        path = _settings_path()
+        if not _os.path.exists(path):
+            return True
+        with open(path, encoding="utf-8") as f:
+            txt = f.read()
+        # 流式写法:dsh-guard-panel: {autoAudit: false}(同一行)
+        m_flow = _re.search(r"^dsh-guard-panel:[ \t]*\{([^}]*)\}", txt, _re.M)
+        if m_flow:
+            mm = _re.search(r"autoAudit\s*:\s*['\"]?(true|false)['\"]?", m_flow.group(1), _re.I)
+            return True if not mm else (mm.group(1).lower() != "false")
+        # 块式写法(带引号的 "false" 同样合法,以前读不出来)
+        m = _re.search(r"^dsh-guard-panel:[^\n]*\n((?:[ \t]+.*\n?)*)", txt, _re.M)
+        if not m:
+            return True
+        mm = _re.search(r"^[ \t]+autoAudit:[ \t]*['\"]?(true|false)['\"]?[ \t]*$", m.group(1), _re.M | _re.I)
+        return True if not mm else (mm.group(1).lower() != "false")
+    except Exception:
+        return True
+
+
+def _recent_entries(n=30):
+    """读审计日志最后 n 条(给 dsh 面板用;条数很少,直接读文件最省事)。"""
+    import os, json
+    path = _LOG_PATH or next((x for x in _log_candidates() if os.path.exists(x)), None)
+    if not path:
+        return []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = [x for x in f.read().splitlines() if x.strip()]
+    except Exception:
+        return []
+    out = []
+    for ln in lines[-n:]:
+        try:
+            out.append(json.loads(ln))
+        except Exception:
+            continue
+    return out
+
+
 def audit(entry):
     """追加一条审计记录。
 
@@ -44,6 +192,9 @@ def audit(entry):
     """
     global _LOG_PATH
     import os, json, datetime, sys
+    # 面板上的"自动记录审计日志"开关真的管用:关掉就不写(以前这里没读它,开关是装饰)
+    if not _auto_audit_enabled():
+        return
     e = dict(entry); e.setdefault("ts", datetime.datetime.now().isoformat(timespec="seconds"))
     line = json.dumps(e, ensure_ascii=False) + "\n"
     for p in ([_LOG_PATH] if _LOG_PATH else _log_candidates()):
@@ -54,6 +205,13 @@ def audit(entry):
             with open(p, "a", encoding="utf-8") as f:
                 f.write(line)
             _LOG_PATH = p
+            # 顺手把最近记录发布给 dsh 的守门面板(settings.yaml)。
+            # 面板的数据通道只有这一条:浏览器读不了本地文件,服务端插件又写不进 settings,
+            # 所以由这里直接写进配置文件。失败绝不影响检查结果。
+            try:
+                _publish_history_to_settings(_recent_entries(30), 30)
+            except Exception:
+                pass
             return
         except Exception:
             continue
@@ -74,6 +232,92 @@ def show_log(n=10, grep=None):
         except Exception: print(line)
 
 _LOG_PATH = None  # 实际写入成功的日志路径(首次成功后缓存,避免每次都试探)
+
+def _settings_path():
+    """dsh 的 settings.yaml 路径(面板插件从这里读数据)。"""
+    return _os.path.expanduser(_os.path.join("~", ".dsh", "settings.yaml"))
+
+
+def _publish_history_to_settings(entries, limit=30):
+    """把最近若干条审计记录写进 dsh 的 settings.yaml(最新在前),供守门面板显示。
+
+    为什么绕这一圈:dsh 的 settings 通道是"浏览器端能写、服务端插件写不进",而浏览器读不了
+    本地文件 —— 外部产生的数据只能由本工具写进配置文件。代价:面板显示的是快照。
+
+    这个函数以前"手太重",实测被指出四处越权/粗糙(REPORT13 #7),逐条收住:
+      a) 面板没装(settings.yaml 里没有 dsh-guard-panel: 段)时**不凭空创建** ——
+         跑一次安全检查不该等于"往用户的 DSH 主配置里加一个新顶层键";
+      b) 用二进制读写**保留原有行尾** —— 文本模式会把 CRLF 归一、写回时全文件变 CRLF,
+         实测一次 check 就能让整个 settings.yaml 的每一行都变(与"其余原文照抄"不符);
+      c) 流式写法 dsh-guard-panel: {autoAudit: false} 一律**不动** ——
+         旧实现会把它整段拆掉、连用户设的 autoAudit 一起丢;
+      d) 写前再对一次 mtime+size,文件在"读-改-写"之间被别人改过就**放弃本次写入**,
+         不去覆盖 DSH 刚保存的设置;
+      另外:备份、只动本段、异常全吞(不影响检查命令)都保持不变。
+    """
+    try:
+        if _os.environ.get("DSH_GUARD_NO_PUBLISH"):
+            return False
+        path = _settings_path()
+        if not _os.path.exists(path):
+            return False
+        st_before = _os.stat(path)
+        with open(path, "rb") as f:                      # (b) 二进制读,行尾原样保留
+            raw = f.read()
+        text = raw.decode("utf-8", "replace")
+        nl = "\r\n" if "\r\n" in text else "\n"
+        lines = text.split(nl)
+
+        start = None
+        for i, ln in enumerate(lines):
+            if ln.startswith("dsh-guard-panel:"):
+                start = i
+                break
+        if start is None:                                # (a) 没装面板 → 不创建
+            return False
+        if lines[start].strip() != "dsh-guard-panel:":   # (c) 流式写法 → 不动
+            return False
+
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if lines[j] and not lines[j][0].isspace():
+                end = j
+                break
+
+        # 段内保留除 history 以外的整行(用户改过的 autoAudit 等不能丢)
+        kept = []
+        k = start + 1
+        while k < end:
+            if lines[k].startswith("  history:"):
+                k += 1
+                while k < end and lines[k].startswith("    "):
+                    k += 1
+                continue
+            if lines[k].strip():
+                kept.append(lines[k])
+            k += 1
+
+        block = ["  history:"]
+        for e in list(reversed(entries or []))[:limit]:   # 最新在前
+            block.append("    - ts: " + json.dumps(str(e.get("ts", ""))))
+            block.append("      verdict: " + json.dumps(str(e.get("verdict", ""))))
+            block.append("      cmd: " + json.dumps(str(e.get("cmd", ""))))
+            block.append("      target: " + json.dumps(str(e.get("target", ""))))
+
+        out = lines[:start] + ["dsh-guard-panel:"] + kept + block + lines[end:]
+
+        st_now = _os.stat(path)                          # (d) 期间被改过 → 放弃
+        if (st_now.st_mtime_ns, st_now.st_size) != (st_before.st_mtime_ns, st_before.st_size):
+            return False
+
+        with open(path + ".dsh-guard.bak", "wb") as f:
+            f.write(raw)
+        with open(path, "wb") as f:                      # (b) 二进制写,行尾不变
+            f.write(nl.join(out).encode("utf-8"))
+        return True
+    except Exception:
+        return False
+
 
 def _log_candidates():
     """审计日志候选路径:环境变量指定 > 家目录 > 当前工作区 > 临时目录。
@@ -172,9 +416,35 @@ def install_script_risk(name, version):
             flags.append(f"依赖可疑投毒标记包 {d}")
     return (flags, note)
 
+def _npm_latest_version(name):
+    """从 npm 的 dist-tags 取 latest —— 没写版本号时先解析出实际版本,而不是跳过检查。
+
+    精简元数据(install-v1)里带 dist-tags,不用取全量文档。
+    """
+    try:
+        req = urllib.request.Request(
+            "https://registry.npmjs.org/" + name,
+            headers={"Accept": "application/vnd.npm.install-v1+json"})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            doc = json.load(r)
+        v = (doc.get("dist-tags") or {}).get("latest")
+        return str(v) if v else None
+    except Exception:
+        return None
+
+
 def check_supply(name, version):
+    _resolved_note = ""
     if not version:
-        return ("warn", f"浮动版本未 pinning — 建议锁定具体版本(如 {name}@0.9.10)")
+        # 没有版本号 ≠ 可以不查。原实现直接 return 一条"浮动版本未 pinning"的 warn,
+        # 而 warn 是可被 --yes 覆盖的 —— 实测 `safe-add <恶意包裸名> --yes` 会 SAFE 放行并执行。
+        # 正确做法:先向 npm 问出实际版本(latest)再照常查;问不到就按 unknown 硬拒
+        # (unknown 与断网/超大文件同档:检查未完成,不许 --yes 覆盖)。
+        resolved = _npm_latest_version(name)
+        if not resolved:
+            return ("unknown", f"未指定版本,且无法从 npm 解析出实际版本 —— 未做检查,不放行")
+        version = resolved
+        _resolved_note = f"(未指定版本,按 npm latest {resolved} 检查)"
     # ① 已知告警(OSV)
     osv_verdict = None
     try:
@@ -191,6 +461,11 @@ def check_supply(name, version):
         # 网络失败 ≠ 安全:明确区分"确认无害"与"无法确认",避免下游把它当成 allow 放行
         osv_verdict = ("unknown", f"无法确认(OSV 查询失败,可能断网): {_sanitize(str(e), 80)}")
     verdict, detail = osv_verdict
+    try:
+        if _resolved_note:
+            detail = detail + " " + _resolved_note
+    except NameError:
+        pass
     # ② 行为启发式(即使 OSV 无记录也可能抓住)
     bflags, bdetail = install_script_risk(name, version)
     joined = detail + ((" " + bdetail) if bdetail else "")
@@ -377,18 +652,23 @@ def check_file(path, is_client=False):
     except RecursionError:
         # 深层嵌套(混淆代码常见)会撑爆 Python 递归 → 降级跳过本项,绝不冒泡
         findings.append(("unknown", "AST 嵌套过深,await 检查未完成(疑似混淆代码)"))
-    # 2) inject 白名单(只对 inject 数组,server/client 分半)
-    allowed = CLIENT_INJECT if is_client else SERVER_INJECT
+    # 2) inject 名字核对:只报"像把已知服务名写错了"的
+    #    旧判据是"不在白名单 ⇒ 有问题",而 dsh 的服务名是开放集合(自带插件就用 24 个,
+    #    硬编码只有 12 个)—— 实测真实插件 6/11 被冤枉,误报 55%。误报会把门变成噪音。
+    known = _discover_services()
     half = "client" if is_client else "server"
     for m in _re.finditer(r"inject\s*=\s*\[([^\]]*)\]", src):
-        for n in _re.findall(r"['\"]([A-Za-z]+)['\"]", m.group(1)):
-            if n not in allowed:
-                findings.append(("warn", f"inject 含 '{n}' 不在白名单({half}半)"))
-    # 3) keyed-slot 缺 key(用括号配平定位整个对象,不用固定字符窗口 —— 否则 key 稍远就误报)
-    for m in _re.finditer(r"name:\s*['\"](settings\.(?:plugin|general)\.item)['\"]", src):
-        obj = _object_around(src, m.start())
-        if obj is not None and not _re.search(r"(?:^|[{,\s])key\s*:", obj):
-            findings.append(("warn", f"keyed-slot {m.group(1)} 缺显式 key(报 requires options.key)"))
+        for n in _re.findall(r"['\"]([A-Za-z_$][\w$]*)['\"]", m.group(1)):
+            if n in known:
+                continue
+            like = _looks_like_typo(n, known)
+            if like:
+                findings.append(("warn", f"inject 里的 '{n}' 像是 '{like}' 写错了({half}半)—— dsh 会因找不到该服务而加载失败"))
+    # 3) keyed-slot 的 key —— 该判据已移除
+    #    原先报"缺显式 key",但 DSH 自家插件(dsh-client-ui-theme)注册 settings.general.item 时
+    #    同样只有 id、没有 key,照样正常渲染;key 在 dsh 里是可选的(用于按 key 定位 entry,
+    #    不传走常规渲染)。判据不成立 ⇒ 只会误报真实插件(cost-meter 就是这么被冤枉的)。
+    #    宁可漏,不误报 —— 这是本工具反复吃过教训的地方。
     # 4) adapter 缺 prepareCall(识 compat 包装)
     if "registerAdapter" in src and "prepareCall" not in src \
        and "ensureAdapterPrepareCall" not in src and "wrapLlmService" not in src:
@@ -636,6 +916,9 @@ def _hostile_scan(path):
             # (实测某插件自身只有 18 个 .js,目录里却含 246 个嵌套依赖 .js)
             if "node_modules" in dirs:
                 dirs.remove("node_modules")
+            # 剪枝:不跟着符号链接/junction 跑出扫描根。os.walk 的 followlinks=False
+            # 对 Windows junction 无效(它不是 symlink),实测能越界读到扫描根之外。
+            dirs[:] = [d for d in dirs if not _is_reparse_point(_os.path.join(dp, d))]
             for f in fs:
                 if f.endswith((".js", ".mjs", ".cjs")):
                     if len(files) >= MAX_SCAN_FILES:
@@ -855,7 +1138,15 @@ def _safe_add(pkg, path, client, delegate, yes=False):
             print("REFUSED → 有 warn 级发现,非交互环境需 --yes 显式放行。")
             audit({"cmd": "safe-add", "target": pkg, "path": path, "verdict": "warn-refused", "detail": d})
             return 1
-        ans = input("有 warn 级发现,仍要执行? [y/N] ").strip().lower()
+        try:
+            ans = input("有 warn 级发现,仍要执行? [y/N] ").strip().lower()
+        except EOFError:
+            # isatty() 为真 ≠ 读得到输入:agent/MCP 调用时 stdin 可能"连着终端但已 EOF"
+            # (本机实测 isatty=True 却立刻 EOF)。这种"问不到人"要干净拒绝,
+            # 而不是把未捕获的 traceback 抛给调用方。
+            print("REFUSED → 读不到输入(非交互环境),需 --yes 显式放行。")
+            audit({"cmd": "safe-add", "target": pkg, "path": path, "verdict": "warn-refused", "detail": d})
+            return 1
         if ans not in ("y", "yes"):
             print("REFUSED → 用户未确认。")
             audit({"cmd": "safe-add", "target": pkg, "path": path, "verdict": "warn-refused", "detail": d})
@@ -896,7 +1187,13 @@ def _snapshot():
 def _major_jump(b, a):
     def mj(v):
         try:
-            p = [int(x) for x in str(v).replace("-", ".").split(".") if x.isdigit()]
+            # 解析这一步以前没人管:直接 split(".") 再按 isdigit() 过滤,于是 "^1" 不是数字被整段丢掉
+            # —— ^1.0.0 与 ^2.0.0 解析结果完全相同(都是 [0,0]),跳变检查在真实 profile 上全瞎
+            # (而真实依赖的写法恰恰全是 ^)。
+            # ① 剥掉范围前缀 ^ ~ >= <= > < = v 与空白;② 预发布串(-rc.1/-beta)只留前三段。
+            raw = _re.sub(r"^[\s\^~=><!v]+", "", str(v).strip())
+            raw = _re.split(r"[-+]", raw)[0]
+            p = [int(x) for x in raw.split(".")[:3] if x.strip().isdigit()]
         except Exception:
             return None
         if not p:
